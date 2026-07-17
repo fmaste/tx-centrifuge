@@ -52,7 +52,7 @@ txTests = Tasty.testGroup "node"
       (signKey, addr) <- testSetup
       let fund = mkDummyFund signKey 0 10_000_000
           fee  = L.Coin 200_000
-      case TxAssembly.buildTx addr signKey [fund] 1 fee of
+      case TxAssembly.buildTx Api.ShelleyBasedEraConway addr signKey [fund] 1 fee of
         Left err ->
           HUnit.assertFailure $ "buildTx failed: " ++ show err
         Right (tx, outFunds) -> do
@@ -70,7 +70,7 @@ txTests = Tasty.testGroup "node"
       let fund1 = mkDummyFund signKey 0 5_000_000
           fund2 = mkDummyFund signKey 1 5_000_000
           fee   = L.Coin 200_000
-      case TxAssembly.buildTx addr signKey
+      case TxAssembly.buildTx Api.ShelleyBasedEraConway addr signKey
              [fund1, fund2] 3 fee of
         Left err ->
           HUnit.assertFailure $ "buildTx failed: " ++ show err
@@ -85,7 +85,7 @@ txTests = Tasty.testGroup "node"
       (signKey, addr) <- testSetup
       let fund = mkDummyFund signKey 0 100_000
           fee  = L.Coin 200_000
-      case TxAssembly.buildTx addr signKey [fund] 1 fee of
+      case TxAssembly.buildTx Api.ShelleyBasedEraConway addr signKey [fund] 1 fee of
         Left _  -> pure () -- expected
         Right _ ->
           HUnit.assertFailure
@@ -94,7 +94,7 @@ txTests = Tasty.testGroup "node"
   , HUnit.testCase "buildTx: no input funds" $ do
       (signKey, addr) <- testSetup
       let fee = L.Coin 200_000
-      case TxAssembly.buildTx addr signKey [] 1 fee of
+      case TxAssembly.buildTx Api.ShelleyBasedEraConway addr signKey [] 1 fee of
         Left _  -> pure () -- expected
         Right _ ->
           HUnit.assertFailure
@@ -104,7 +104,7 @@ txTests = Tasty.testGroup "node"
       (signKey, addr) <- testSetup
       let fund = mkDummyFund signKey 0 10_000_000
           fee  = L.Coin 200_000
-      case TxAssembly.buildTx addr signKey [fund] 0 fee of
+      case TxAssembly.buildTx Api.ShelleyBasedEraConway addr signKey [fund] 0 fee of
         Left _  -> pure () -- expected
         Right _ ->
           HUnit.assertFailure
@@ -152,7 +152,7 @@ txTests = Tasty.testGroup "node"
        -> Api.SigningKey Api.PaymentKey -> L.Coin -> IO ()
     go 0 _ _ _ _ = pure ()
     go remaining fund addr signKey fee =
-      case TxAssembly.buildTx addr signKey [fund] 1 fee of
+      case TxAssembly.buildTx Api.ShelleyBasedEraConway addr signKey [fund] 1 fee of
         Left err ->
           error $ "throughput test: buildTx failed at iteration "
             ++ show remaining ++ ": " ++ show err
