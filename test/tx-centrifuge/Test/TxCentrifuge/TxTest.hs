@@ -3,6 +3,12 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
+-- cardano-api 11 deprecates Api.getTxBody in favour of UnsignedTx from
+-- Cardano.Api.Experimental. This package stays on the stable API so one source
+-- tree builds against cardano-node 10.7.1 through 11.1.1, and the node compiles
+-- local packages with -Werror, so the warning has to go rather than be demoted.
+{-# OPTIONS_GHC -Wno-deprecations #-}
+
 --------------------------------------------------------------------------------
 
 module Test.TxCentrifuge.TxTest

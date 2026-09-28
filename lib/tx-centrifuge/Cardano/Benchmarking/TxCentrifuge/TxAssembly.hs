@@ -1,6 +1,13 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
+-- "cardano-api" 11 deprecates `createTransactionBody`, `TxBodyContent` and
+-- `defaultTxBodyContent` in favour of "Cardano.Api.Experimental.Tx". This
+-- package stays on the stable API so the same source builds against
+-- "cardano-node" 10.7.1 through 11.1.1, also the node compiles local packages
+-- with `-Werror` so the warning has to go.
+{-# OPTIONS_GHC -Wno-deprecations #-}
+
 --------------------------------------------------------------------------------
 
 module Cardano.Benchmarking.TxCentrifuge.TxAssembly

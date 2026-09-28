@@ -45,6 +45,26 @@
       ;
 
       ############################################################################
+      # Shared: is the pinned "cardano-node" input in "leios-prototype" branch?
+      ############################################################################
+
+      # Its "ouroboros-consensus" adds two Leios mini-protocols to a record
+      # "NodeToNode.hs" has to name, and its version number is the same as the
+      # release that does not have them, so tx-centrifuge.cabal cannot work it
+      # out and takes a flag instead. `cardano-crypto-leios` is pinned by that
+      # branch and by no release, which makes it a usable marker.
+      leiosFlagLines =
+        lib.optionals
+          (lib.hasInfix
+            "cardano-crypto-leios"
+            (builtins.readFile "${cardano-node}/cabal.project")
+          )
+          [ "package tx-centrifuge"
+            "  flags: +leios-prototype"
+          ]
+      ;
+
+      ############################################################################
       # `nix build`: the node's own project, with our tree grafted into its src.
       ############################################################################
 
@@ -94,16 +114,21 @@
             ''
           ;
           # The above derivation only produces data. It compiles nothing.
-          # A haskell.nix project is a module-system evaluation, and appendModule adds one more module to it.
+          # A haskell.nix project is a module-system evaluation and appendModule
+          # adds one more module to it. Overriding src is the whole change.
+          # The node compiles local packages with -Werror and we now count as
+          # local, so our warnings are fatal here. A --ghc-option=-Wwarn from
+          # this side loses the ordering race against theirs, so whatever needs
+          # demoting is demoted by an OPTIONS_GHC pragma in the module that
+          # trips it, where the reason is written down next to the code that
+          # caused it.
           project = cardanoNodePkgs.cardanoNodeProject.appendModule
             { src = lib.mkForce src;
-              modules =
-                [ { package-keys = [ "tx-centrifuge" ];
-                    # -Wwarn undoes the `-Werror` the node applies to local
-                    # packages, which we now are. Later flags win.
-                    packages.tx-centrifuge.configureFlags = [ "--ghc-option=-Wwarn" ];
-                  }
-                ]
+              cabalProjectLocal =
+                lib.mkForce
+                  (  cardanoNodePkgs.cardanoNodeProject.args.cabalProjectLocal
+                  + lib.concatMapStrings (l: l + "\n") leiosFlagLines
+                  )
               ;
             }
           ;
@@ -127,6 +152,16 @@
               "trace-resources"
               "bench/tx-generator"
             ]
+          ;
+
+          # Not every checkout carries all of them: cardano-node 11.1.1 dropped
+          # trace-resources from its own tree and takes it from CHaP like any
+          # other dependency. Naming a directory that is not there is a hard
+          # error from cabal, so only the ones present are listed, and the rest
+          # are recorded in the generated file rather than passed over quietly.
+          localPackages = lib.partition
+            (p: builtins.pathExists "${cardano-node}/${p}")
+            nodePackages
           ;
           # The node project's local-package stanzas are the only thing dropped:
           # their paths are relative to that checkout, and the four above are
@@ -165,7 +200,9 @@
               "packages:"
               "  ."
             ]
-            ++ map (p: "  ${cardano-node}/${p}") nodePackages
+            ++ map (p: "  ${cardano-node}/${p}") localPackages.right
+            ++ map (p: "-- not in this checkout, comes from CHaP: ${p}")
+                 localPackages.wrong
             ++
             [ ""
               "-- tx-centrifuge never calls sd_notify; keeps libsystemd out of the build."
@@ -176,6 +213,8 @@
               "  flags: -systemd"
               ""
             ]
+            ++ leiosFlagLines
+            ++ lib.optional (leiosFlagLines != [ ]) ""
             ++ dropLocalPackages (builtins.readFile "${cardano-node}/cabal.project")
           ;
         in

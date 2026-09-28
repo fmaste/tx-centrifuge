@@ -27,8 +27,52 @@ data-files:       data/config-shared-10.json
 
 --------------------------------------------------------------------------------
 
+-- Says that the pinned "cardano-node" is in the "leios-prototype" branch.
+-- That branch pins an "ouroboros-consensus" and an "ouroboros-network" carrying
+-- API changes that no version number reveals: both keep the version of the
+-- release they forked from. "NodeToNode.hs" has three of them so far, listed
+-- there. A version bound cannot see this and neither can the solver, so it is
+-- declared.
+-- The flake sets this flag when the "cardano-node" it is pointed at is that
+-- branch. For a plain cabal build against it, pass `--flag=+leios-prototype`.
+flag leios-prototype
+  description:        The pinned cardano-node is its leios-prototype branch,
+                      whose consensus and network libraries differ from the
+                      releases they share a version number with.
+  default:            False
+  manual:             True
+
+-- The module "Ouroboros.Network.Tracing" is exposed by one of two sublibraries
+-- of the "ouroboros-network" package. It used to be `framework-tracing` (it was
+-- later moved to `tracing` and `framework-tracing` was deleted) The module name
+-- and contents did not change, so only the dependency below differs.
+-- The version number does not tell you which layout you have. Three cases:
+--   ouroboros-network 1.1.0.0 released    both sublibraries exist, and the
+--                                         module is in `framework-tracing`.
+--   ouroboros-network 1.1.0.0 as pinned   only `tracing` exists; the branch by
+--                                         cardano-node's "leios-prototype"
+--                                         already carries the move.
+--   ouroboros-network 1.2.0.0 and later   only `tracing` exists.
+-- So the two branches below are told apart by which sublibrary exists, not by a
+-- version bound. The flag is not manual, so cabal decides: it tries the default
+-- first and flips when that fails. The default has to be False, the
+-- `framework-tracing` branch, because that is the only case where both
+-- sublibraries exist and so the only case cabal cannot work out for itself.
+flag network-tracing-merged
+  description:        This ouroboros-network serves "Ouroboros.Network.Tracing"
+                      from its `tracing` sublibrary and has no
+                      `framework-tracing` sublibrary.
+  default:            False
+  manual:             False
+
+--------------------------------------------------------------------------------
+
 common project-config
   default-language:   Haskell2010
+  -- Every component needs this: the branch differs from the releases in the
+  -- library and in app/Main.hs alike.
+  if flag(leios-prototype)
+    cpp-options:      -DLEIOS_PROTOTYPE
 
 common ghc-warnings
   ghc-options:        -Wall
@@ -130,14 +174,16 @@ library tx-centrifuge-lib
                     , cardano-ledger-api
                     , cardano-ledger-core
                     , containers
-                    , contra-tracer
+                    -- Version 0.2.0.0 is excluded because it cannot be used:
+                    -- its `Tracer` constructor no longer accepts a function and
+                    -- it has no `mkTracer` yet, so neither branch makes
+                    -- "Tracing.hs" compile. Excluding it here makes cabal pick
+                    -- a version that works instead of failing to compile.
+                    , contra-tracer <0.2 || >=0.2.1
                     , io-classes:{io-classes, strict-stm}
                     , network
                     , network-mux
                     , ouroboros-consensus:{ouroboros-consensus, cardano, diffusion}
-                    -- TODO: Modules from lib "framework-tracing" will be in lib "tracing" on the next release of ouroboros-network.
-                    --       See commit 12896145d1626ce98e7c85623316e5e3e05e8dc1 of ouroboros-network.
-                    , ouroboros-network:{ouroboros-network, api, framework, framework-tracing, protocols}
                     , random
                     , serialise
                     -- avoid stm-2.5.2 https://github.com/haskell/stm/issues/76
@@ -146,6 +192,16 @@ library tx-centrifuge-lib
                     , time
                     , trace-dispatcher
                     , typed-protocols:{typed-protocols, stateful}
+  -- Which branch fits is decided by which sublibrary "ouroboros-network" has.
+  -- No upper bounds here on purpose, see the flag's comment above.
+  if flag(network-tracing-merged)
+    build-depends:    ouroboros-network:{ouroboros-network, api, framework, protocols, tracing} >=1.1
+    -- To make the `import` banners in "Tracing.hs" name the sublibrary this
+    -- branch actually picked, instead of testing the version a second time and
+    -- eventually disagreeing with it.
+    cpp-options:      -DNETWORK_TRACING_MERGED
+  else
+    build-depends:    ouroboros-network:{ouroboros-network, api, framework, protocols, framework-tracing} >=1.1
 
 --------------------------------------------------------------------------------
 

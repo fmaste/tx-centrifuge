@@ -2,6 +2,12 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE TypeApplications #-}
 
+-- "cardano-api" 11 deprecates `Api.getTxBody` in favour of `UnsignedTx` from
+-- "Cardano.Api.Experimental". This package stays on the stable API so the same
+-- source builds against "cardano-node" 10.7.1 through 11.1.1, also the node
+-- compiles local packages with `-Werror` so the warning has to go.
+{-# OPTIONS_GHC -Wno-deprecations #-}
+
 --------------------------------------------------------------------------------
 
 -- | LocalTxSubmission client for NodeToClient connections.
