@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImportQualifiedPost #-}
@@ -82,6 +83,9 @@ import Ouroboros.Consensus.Shelley.Ledger.SupportsProtocol ()
 import Ouroboros.Network.Magic qualified as Magic
 import Ouroboros.Network.PeerSelection.PeerSharing qualified as PeerSharing
 import Ouroboros.Network.PeerSelection.PeerSharing.Codec qualified as PSCodec
+#if MIN_VERSION_cardano_diffusion(1,1,0) || defined(LEIOS_PROTOTYPE)
+import Ouroboros.Network.PerasSupport qualified as Peras
+#endif
 ---------------------------------
 -- ouroboros-network:framework --
 ---------------------------------
@@ -151,6 +155,40 @@ emptyClients = Clients
 -- Mini-protocol builders.
 --------------------------------------------------------------------------------
 
+-- | The fully applied node-to-node codec record, named once because its arity
+-- changes with the "ouroboros-consensus" it is built against.
+--
+-- The released "ouroboros-consensus" 3.0.1 gives `NetN2N.Codecs` seven payload
+-- parameters. Two later versions add two mini-protocols each, for unrelated
+-- reasons, taking it to nine:
+--
+--   "ouroboros-consensus" 4                     Peras, `bPCD` and `bPVD`
+--   the "ouroboros-consensus" pinned            Leios, `bLN` and `bLF`
+--   by "cardano-node" branch "leios-prototype"
+--
+-- All nine parameters are `BSL.ByteString` here, so one branch serves both.
+-- Consensus publishes no synonym to hide the arity, and every signature below
+-- needs the type, so this is the one place that changes.
+--
+-- The Leios one is numbered 3.0.1, the same as the release with seven
+-- parameters, so no version test can tell them apart. It is recognised by the
+-- cabal flag `leios-prototype` instead, which the flake sets when the
+-- "cardano-node" it is pointed at is that branch.
+#if MIN_VERSION_ouroboros_consensus(4,0,0) || defined(LEIOS_PROTOTYPE)
+type N2NCodecs =
+  NetN2N.Codecs Block.CardanoBlock NtN.RemoteAddress
+    Serialise.DeserialiseFailure IO
+    BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
+    BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
+    BSL.ByteString
+#else
+type N2NCodecs =
+  NetN2N.Codecs Block.CardanoBlock NtN.RemoteAddress
+    Serialise.DeserialiseFailure IO
+    BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
+    BSL.ByteString BSL.ByteString BSL.ByteString
+#endif
+
 -- | Protocol limits matching cardano-diffusion defaults.
 -- See Cardano.Network.NodeToNode.defaultMiniProtocolParameters.
 
@@ -172,10 +210,7 @@ txSubmissionLimits = NetMux.MiniProtocolLimits
 
 -- | Build a BlockFetch mini-protocol.
 mkBlockFetchMiniProtocol
-  :: NetN2N.Codecs Block.CardanoBlock NtN.RemoteAddress
-       Serialise.DeserialiseFailure IO
-       BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
-       BSL.ByteString BSL.ByteString BSL.ByteString
+  :: N2NCodecs
   -> TxIdSync.BlockFetchClient
   -> NetMux.MiniProtocol
        'Mux.InitiatorMode
@@ -194,10 +229,7 @@ mkBlockFetchMiniProtocol codecs client = NetMux.MiniProtocol
 
 -- | Build a ChainSync mini-protocol.
 mkChainSyncMiniProtocol
-  :: NetN2N.Codecs Block.CardanoBlock NtN.RemoteAddress
-       Serialise.DeserialiseFailure IO
-       BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
-       BSL.ByteString BSL.ByteString BSL.ByteString
+  :: N2NCodecs
   -> TxIdSync.ChainSyncClient
   -> NetMux.MiniProtocol
        'Mux.InitiatorMode
@@ -216,10 +248,7 @@ mkChainSyncMiniProtocol codecs client = NetMux.MiniProtocol
 
 -- | Build a KeepAlive mini-protocol.
 mkKeepAliveMiniProtocol
-  :: NetN2N.Codecs Block.CardanoBlock NtN.RemoteAddress
-       Serialise.DeserialiseFailure IO
-       BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
-       BSL.ByteString BSL.ByteString BSL.ByteString
+  :: N2NCodecs
   -> Tracing.Tracers
   -> KeepAlive.KeepAliveClient
   -> NetMux.MiniProtocol
@@ -236,7 +265,13 @@ mkKeepAliveMiniProtocol codecs tracers client = NetMux.MiniProtocol
           Driver.runPeerWithLimits
             (Tracing.trKeepAlive tracers)
             (NetN2N.cKeepAliveCodec codecs)
+#ifdef LEIOS_PROTOTYPE
+            -- Branch "leios-prototype" fixed these limits; every release still
+            -- asks for a size function. `const 0` means no limit.
+            KACodec.byteLimitsKeepAlive
+#else
             (KACodec.byteLimitsKeepAlive (const 0))
+#endif
             KACodec.timeLimitsKeepAlive
             channel
             $ KAClient.keepAliveClientPeer client
@@ -244,10 +279,7 @@ mkKeepAliveMiniProtocol codecs tracers client = NetMux.MiniProtocol
 
 -- | Build a TxSubmission mini-protocol.
 mkTxSubmissionMiniProtocol
-  :: NetN2N.Codecs Block.CardanoBlock NtN.RemoteAddress
-       Serialise.DeserialiseFailure IO
-       BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
-       BSL.ByteString BSL.ByteString BSL.ByteString
+  :: N2NCodecs
   -> Tracing.Tracers
   -> TxSubmission.TxSubmissionClient
   -> NetMux.MiniProtocol
@@ -343,6 +375,14 @@ connect
                 , NtN.diffusionMode = NtN.InitiatorOnlyDiffusionMode
                 , NtN.peerSharing = PeerSharing.PeerSharingDisabled
                 , NtN.query = False
+#if MIN_VERSION_cardano_diffusion(1,1,0) || defined(LEIOS_PROTOTYPE)
+                -- A strict field from "cardano-diffusion" 1.1 on, so it has to
+                -- be given. Branch "leios-prototype" has it too, while still
+                -- numbered 1.0.
+                -- We diffuse no Peras votes or certificates, same as
+                -- tx-generator, which also sets PerasUnsupported.
+                , NtN.perasSupport = Peras.PerasUnsupported
+#endif
                 }
             )
             $ \_n2nData -> bundleToApp
@@ -360,10 +400,7 @@ connect
     -- | Build the protocol bundle with conditional protocol inclusion.
     -- Protocols with 'Nothing' clients are excluded (empty list).
     protocolBundle
-      :: NetN2N.Codecs Block.CardanoBlock NtN.RemoteAddress
-           Serialise.DeserialiseFailure IO
-           BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
-           BSL.ByteString BSL.ByteString BSL.ByteString
+      :: N2NCodecs
       -> NetMux.OuroborosBundle
            'Mux.InitiatorMode
            (NetCtx.MinimalInitiatorContext NtN.RemoteAddress)

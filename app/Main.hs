@@ -1,9 +1,16 @@
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE NumericUnderscores #-}
+
+-- "cardano-api" 11 deprecates `Api.getTxBody` in favour of `UnsignedTx` from
+-- "Cardano.Api.Experimental". This package stays on the stable API so the same
+-- source builds against "cardano-node" 10.7.1 through 11.1.1, also the node
+-- compiles local packages with `-Werror` so the warning has to go.
+{-# OPTIONS_GHC -Wno-deprecations #-}
 
 --------------------------------------------------------------------------------
 
@@ -807,9 +814,9 @@ loadConfig = do
   hPutStrLn stderr $ "Loading node config from: " ++ nodeConfigPath
   nodeConfig <- mkNodeConfig nodeConfigPath >>= either die pure
   protocol   <- mkConsensusProtocol nodeConfig >>= either die pure
-  let codecConfig  = protocolToCodecConfig protocol
-      networkId    = protocolToNetworkId protocol
-      networkMagic = protocolToNetworkMagic protocol
+  codecConfig  <- protocolToCodecConfig protocol
+  networkId    <- protocolToNetworkId protocol
+  networkMagic <- protocolToNetworkMagic protocol
 
   -- Load initial funds. Look the initial_inputs source up in the raw config
   -- (validate also checks the reference, but funds are loaded first, so a
@@ -888,6 +895,13 @@ mkNodeConfig configFp_ = do
           , shelleyVRFFile       = Just ""
           , shelleyCertFile      = Just ""
           , shelleyBulkCredsFile = Just ""
+#ifdef LEIOS_PROTOTYPE
+          -- A strict field and only on the "leios-prototype" branch, for the
+          -- Leios BLS key. No released "cardano-node" has it, including 11.1.1,
+          -- which is numbered above the 11.1.0.164 of that branch, so no
+          -- version test finds it.
+          , shelleyBLSFile       = Nothing
+#endif
           }
       , pncShutdownConfig = Last $ Just $ ShutdownConfig Nothing Nothing
       , pncConfigFile = Last $ Just configFp
@@ -900,28 +914,47 @@ mkConsensusProtocol nodeConfig =
     NodeProtocolConfigurationCardano
       byronCfg shelleyCfg alonzoCfg conwayCfg
       dijkstraCfg hardforkCfg checkpointsCfg ->
+#if MIN_VERSION_cardano_node(11,1,0)
+        -- "cardano-node" 11.1 returns the Shelley genesis hash alongside the
+        -- protocol and the protocol is wanted here.
+        first show . fmap fst <$>
+#else
         first show <$>
+#endif
           runExceptT (mkSomeConsensusProtocolCardano
             byronCfg shelleyCfg alonzoCfg conwayCfg
             dijkstraCfg hardforkCfg checkpointsCfg Nothing)
 
-protocolToCodecConfig :: SomeConsensusProtocol -> CodecConfig Block.CardanoBlock
+protocolToCodecConfig :: SomeConsensusProtocol -> IO (CodecConfig Block.CardanoBlock)
 protocolToCodecConfig (SomeConsensusProtocol Api.CardanoBlockType info) =
-    configCodec $ pInfoConfig $ fst $ Api.protocolInfo @IO info
+#if MIN_VERSION_ouroboros_consensus(4,0,0) || defined(LEIOS_PROTOTYPE)
+    -- "ouroboros-consensus" 4 made `protocolInfo` monadic (so the KES agent
+    -- can be consulted while building it). Below version 4 the result is pure.
+    configCodec . pInfoConfig . fst <$> Api.protocolInfo @IO info
+#else
+    pure $ configCodec $ pInfoConfig $ fst $ Api.protocolInfo @IO info
+#endif
 protocolToCodecConfig _ =
   error "protocolToCodecConfig: non-Cardano protocol"
 
 -- | Derive NetworkId from the consensus config. Mainnet uses a
 -- well-known magic number; everything else is a testnet.
-protocolToNetworkId :: SomeConsensusProtocol -> Api.NetworkId
-protocolToNetworkId proto = case protocolToNetworkMagic proto of
-  Api.NetworkMagic 764824073 -> Api.Mainnet
-  nm                         -> Api.Testnet nm
+protocolToNetworkId :: SomeConsensusProtocol -> IO Api.NetworkId
+protocolToNetworkId proto = do
+  magic <- protocolToNetworkMagic proto
+  pure $ case magic of
+    Api.NetworkMagic 764824073 -> Api.Mainnet
+    nm                         -> Api.Testnet nm
 
-protocolToNetworkMagic :: SomeConsensusProtocol -> Api.NetworkMagic
+protocolToNetworkMagic :: SomeConsensusProtocol -> IO Api.NetworkMagic
 protocolToNetworkMagic
   (SomeConsensusProtocol Api.CardanoBlockType info) =
-    getNetworkMagic $ configBlock $ pInfoConfig $
+#if MIN_VERSION_ouroboros_consensus(4,0,0) || defined(LEIOS_PROTOTYPE)
+    getNetworkMagic . configBlock . pInfoConfig . fst
+      <$> Api.protocolInfo @IO info
+#else
+    pure $ getNetworkMagic $ configBlock $ pInfoConfig $
       fst $ Api.protocolInfo @IO info
+#endif
 protocolToNetworkMagic _ =
   error "protocolToNetworkMagic: non-Cardano protocol"

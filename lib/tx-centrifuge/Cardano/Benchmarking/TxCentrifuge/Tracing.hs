@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE PackageImports #-}
@@ -45,7 +46,16 @@ import Data.Map.Strict qualified as Map
 -------------------
 -- contra-tracer --
 -------------------
-import "contra-tracer" Control.Tracer (Tracer (..), traceWith)
+-- `mkTracer` comes from the library in 0.2.1 and later. In 0.1 it does not
+-- exist, so this module defines it below from the `Tracer` constructor.
+-- Version 0.2.0.0 cannot be used at all: its constructor no longer accepts a
+-- function and it has no `mkTracer` yet, so neither branch below compiles. The
+-- cabal file forbids that version, so cabal never chooses it.
+#if MIN_VERSION_contra_tracer(0,2,1)
+import "contra-tracer" Control.Tracer (Tracer, mkTracer, nullTracer, traceWith)
+#else
+import "contra-tracer" Control.Tracer (Tracer (..), nullTracer, traceWith)
+#endif
 ---------------------------------
 -- ouroboros-consensus:cardano --
 ---------------------------------
@@ -59,12 +69,24 @@ import Ouroboros.Consensus.Ledger.SupportsMempool qualified as Mempool
 -- ouroboros-network:framework --
 ---------------------------------
 import Ouroboros.Network.Driver.Simple qualified as Simple
+#ifdef NETWORK_TRACING_MERGED
+-------------------------------
+-- ouroboros-network:tracing --
+-------------------------------
+#else
 -----------------------------------------
 -- ouroboros-network:framework-tracing --
 -----------------------------------------
+#endif
 -- For the MetaTrace and LogFormatting instances of:
 -- - Simple.TraceSendRecv
 -- - Stateful.TraceSendRecv
+-- The module `Ouroboros.Network.Tracing` is exposed by two different
+-- sublibraries of the `ouroboros-network` package: `framework-tracing` in older
+-- ones, `tracing` in newer ones. The version number does not tell you which.
+-- `#if` above is only to have the correct sublibrary name in the comment.
+-- Which sublibrary is used is decided in the cabal file, by the
+-- `network-tracing-merged` flag, which also defines NETWORK_TRACING_MERGED.
 import Ouroboros.Network.Tracing ()
 ---------------------------------
 -- ouroboros-network:protocols --
@@ -135,18 +157,36 @@ data Tracers = Tracers
 -- | All-silent tracers.
 nullTracers :: Tracers
 nullTracers = Tracers
-  { trBuilder       = Tracer (\_ -> pure ())
-  , trPipe          = Tracer (\_ -> pure ())
-  , trRecycler      = Tracer (\_ -> pure ())
-  , trObserver      = Tracer (\_ -> pure ())
-  , trTxSubmission  = Tracer (\_ -> pure ())
-  , trTxSubmission2 = Tracer (\_ -> pure ())
-  , trKeepAlive     = Tracer (\_ -> pure ())
+  { trBuilder       = nullTracer
+  , trPipe          = nullTracer
+  , trRecycler      = nullTracer
+  , trObserver      = nullTracer
+  , trTxSubmission  = nullTracer
+  , trTxSubmission2 = nullTracer
+  , trKeepAlive     = nullTracer
   }
 
 --------------------------------------------------------------------------------
 -- Tracer setup
 --------------------------------------------------------------------------------
+
+#if !MIN_VERSION_contra_tracer(0,2,1)
+-- | Makes a `Tracer` from a function. Only needed for "contra-tracer" 0.1.
+-- (A `Tracer m a` receives trace events. You make one from a function
+-- `a -> m ()` that says what to do with each event).
+--
+-- In "contra-tracer" 0.1 the `Tracer` constructor takes that function, so this
+-- is the constructor under another name. In 0.2 the constructor changed and no
+-- longer accepts a function. 0.2.1 added its own `mkTracer` for this. Defining
+-- `mkTracer` here for 0.1 keeps the code that builds tracers the same for every
+-- version.
+--
+-- The type has no `Applicative m` constraint (unlike the `mkTracer` in 0.2.1):
+-- the 0.1 constructor does not need it and an unused constraint is a warning,
+-- which `-Werror` will turn it into a build failure.
+mkTracer :: (a -> m ()) -> Tracer m a
+mkTracer = Tracer
+#endif
 
 -- | Create configured tracers from the tx-centrifuge config file. If the file
 -- contains a @TraceOptions@ section, those settings are used. Otherwise falls
@@ -157,7 +197,12 @@ setupTracers configFile = do
     either
       (\(_ :: SomeException) -> defaultTraceConfig)
       id
+#if MIN_VERSION_trace_dispatcher(2,13,0)
+      -- 2.13 reads from a ConfigSource rather than straight from a path.
+      <$> try (Logging.readConfiguration (Logging.FromFile configFile))
+#else
       <$> try (Logging.readConfiguration configFile)
+#endif
   configReflection <- Logging.emptyConfigReflection
   stdoutTrace      <- Logging.standardTracer
   let trForward = mempty
@@ -195,13 +240,13 @@ setupTracers configFile = do
                      ["KeepAlive"]
   Logging.configureTracers configReflection trConfig [keepAliveTr]
   pure Tracers
-    { trBuilder       = Tracer $ Logging.traceWith builderTr
-    , trPipe          = Tracer $ Logging.traceWith pipeTr
-    , trRecycler      = Tracer $ Logging.traceWith recyclerTr
-    , trObserver      = Tracer $ Logging.traceWith observerTr
-    , trTxSubmission  = Tracer $ Logging.traceWith txSubTraceTr
-    , trTxSubmission2 = Tracer $ Logging.traceWith txSub2Trace
-    , trKeepAlive     = Tracer $ Logging.traceWith keepAliveTr
+    { trBuilder       = mkTracer $ Logging.traceWith builderTr
+    , trPipe          = mkTracer $ Logging.traceWith pipeTr
+    , trRecycler      = mkTracer $ Logging.traceWith recyclerTr
+    , trObserver      = mkTracer $ Logging.traceWith observerTr
+    , trTxSubmission  = mkTracer $ Logging.traceWith txSubTraceTr
+    , trTxSubmission2 = mkTracer $ Logging.traceWith txSub2Trace
+    , trKeepAlive     = mkTracer $ Logging.traceWith keepAliveTr
     }
 
 -- | Default config: stdout machine format, severity Debug for all namespaces.
