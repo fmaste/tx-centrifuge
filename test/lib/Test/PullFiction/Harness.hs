@@ -16,6 +16,7 @@ module Test.PullFiction.Harness
   , runTest
   , runTpsTest
   , runPipelineIsolationTest
+  , runSharedInputsTest
     -- * Metrics & formatting
   , getDuration
   , formatMetrics
@@ -120,14 +121,14 @@ resolveConfig path inputs = do
       key <- IORef.atomicModifyIORef' keyCounter (\n -> (n + 1, n))
       Runtime.baAddPayload api key (head is) is is)
     -- mkPipeHandle: no-op trace handlers.
-    (\_ _ -> pure Runtime.PipeHandle
+    (\_ _ _ -> pure Runtime.PipeHandle
       { Runtime.phOnInputsEnqueued  = \_ _ -> pure ()
       , Runtime.phOnInputsDequeued  = \_ _ -> pure ()
       , Runtime.phOnPayloadEnqueued = \_ _ -> pure ()
       , Runtime.phOnPayloadDequeued = \_ _ -> pure ()
       })
     -- mkRecyclerHandle: no-op recycle handler.
-    (\_ _ -> pure Runtime.RecyclerHandle
+    (\_ _ _ -> pure Runtime.RecyclerHandle
       { Runtime.rhOnAddToBacklog = \_ _ _ _ -> pure ()
       , Runtime.rhOnAddToPipe    = \_ _ -> pure ()
       , Runtime.rhOnReset        = \_ _ _ _ -> pure ()
@@ -308,6 +309,61 @@ runPipelineIsolationTest configPath nWorkloads durationSecs = do
           Nothing   -> pure ()
           Just tag' -> check tag'
   pure ()
+
+-- | Run a shared-input test: the property opposite to
+-- 'runPipelineIsolationTest'. Under @\"scope\": \"shared\"@ every workload
+-- draws from one input queue, so a workload is meant to work on inputs tagged
+-- for another workload.
+--
+-- Inputs are the same @(Int, Int)@ tuples, the workload index first.
+-- 'Runtime.resolve' puts all of them in one queue and loads them in tag order,
+-- so a workload of higher index meets inputs tagged @0@ long before any of its
+-- own. The test counts the observations whose tag is foreign and fails if there
+-- is none, which is exactly what per-workload queues produce (there the count
+-- is 0 by construction, see 'runPipelineIsolationTest').
+runSharedInputsTest
+  -- | Path to the JSON config file.
+  :: FilePath
+  -- | Number of workloads (must match config).
+  -> Int
+  -- | Test duration in seconds.
+  -> Double
+  -> IO ()
+runSharedInputsTest configPath nWorkloads durationSecs = do
+  let inputsPerWorkload = 2000
+      taggedInputs =
+        [ (i, j)
+        | i <- [0 :: Int .. nWorkloads - 1]
+        , j <- [0 :: Int .. inputsPerWorkload - 1]
+        ]
+  inputs <- case taggedInputs of
+    (t:ts) -> pure (t NE.:| ts)
+    []     -> fail "runSharedInputsTest: nWorkloads must be >= 1"
+  runtime <- resolveConfig configPath inputs
+  -- Workloads are stored in a Map, so keys are ascending, the order the inputs
+  -- were tagged in.
+  let nameToTag = Map.fromList $
+        zip (Map.keys (Runtime.workloads runtime)) [0 :: Int ..]
+  foreignCount <- IORef.newIORef (0 :: Int)
+  -- Workers: fetch payload (= input tag) and count it when the tag is another
+  -- workload's. Both the blocking and the non-blocking path are exercised on
+  -- every iteration, as in 'runPipelineIsolationTest'.
+  _ <- runTest runtime durationSecs $
+    \workload _target fetchPayload tryFetchPayload -> do
+      let expectedTag = nameToTag Map.! Runtime.workloadName workload
+          count (wlIdx, _) =
+            when (wlIdx /= expectedTag) $
+              IORef.atomicModifyIORef' foreignCount (\c -> (c + 1, ()))
+      forever $ do
+        tag <- fetchPayload
+        count tag
+        mTag <- tryFetchPayload
+        case mTag of
+          Nothing   -> pure ()
+          Just tag' -> count tag'
+  observed <- IORef.readIORef foreignCount
+  when (observed == 0) $
+    fail "Inputs not shared: every workload only saw inputs tagged for itself"
 
 --------------------------------------------------------------------------------
 -- Metrics & formatting

@@ -252,19 +252,19 @@ main = do
               Runtime.baAddPayload api txId tx inputFunds outputFunds
 
   -- Pipe-events factory passed to 'Runtime.resolve'. Returns a 'PipeHandle'
-  -- Given builder's zero-based index and name create the handlers for the four
-  -- pipe's queue mechanics (TxCentrifuge.Pipe.*): payloads added/removed (with
-  -- the resulting queue depth) and inputs added/removed
-  -- (TxCentrifuge.Pipe.Inputs{Enqueued,Dequeued}, with the inputs themselves
-  -- and the resulting queue depth).
-  let mkPipeHandle _pipeIndex builderName =
+  -- Given builder's zero-based index, builder name and input queue name create
+  -- the handlers for the four pipe's queue mechanics (TxCentrifuge.Pipe.*):
+  -- payloads added/removed (with the resulting queue depth) and inputs
+  -- added/removed (TxCentrifuge.Pipe.Inputs{Enqueued,Dequeued}, with the inputs
+  -- themselves and the resulting queue depth).
+  let mkPipeHandle _pipeIndex builderName inputQueueName =
         pure Runtime.PipeHandle
           { Runtime.phOnInputsEnqueued = \inputs depth ->
               Tracing.traceWith (Tracing.trPipe tracers)
-                (Tracing.PipeInputsEnqueued builderName depth inputs)
+                (Tracing.PipeInputsEnqueued inputQueueName depth inputs)
           , Runtime.phOnInputsDequeued = \inputs depth ->
               Tracing.traceWith (Tracing.trPipe tracers)
-                (Tracing.PipeInputsDequeued builderName depth inputs)
+                (Tracing.PipeInputsDequeued inputQueueName depth inputs)
           , Runtime.phOnPayloadEnqueued = \key depth ->
               Tracing.traceWith (Tracing.trPipe tracers)
                 (Tracing.PipePayloadEnqueued builderName depth key)
@@ -343,13 +343,15 @@ main = do
                   in attempt
 
   -- Recycler-events factory passed to 'Runtime.resolve'. Returns a
-  -- 'RecyclerHandle'. Given the builder's zero-based index and name, creates
-  -- the handlers that trace when a payload enters the backlog
-  -- (TxCentrifuge.Recycler.AddToBacklog), when its inputs are added to the
-  -- pipe (TxCentrifuge.Recycler.AddToPipe), and the optional recovery action
-  -- (see 'mkRecover'). The pipe and recycler are both named by the workload
-  -- here (one of each per workload).
-  let mkRecyclerHandle recyclerIndex builderName = do
+  -- 'RecyclerHandle'. Given the builder's zero-based index and name and the
+  -- name of the input queue it recycles into, creates the handlers that trace
+  -- when a payload enters the backlog (TxCentrifuge.Recycler.AddToBacklog),
+  -- when its inputs are added to the pipe (TxCentrifuge.Recycler.AddToPipe),
+  -- and the optional recovery action (see 'mkRecover'). The recycler is named
+  -- by the workload (one per workload) and the pipe by that input queue, the
+  -- same split 'mkPipeHandle' makes, so one enqueue is reported under one name
+  -- by both TxCentrifuge.Pipe.InputsEnqueued and this.
+  let mkRecyclerHandle recyclerIndex builderName inputQueueName = do
         recover <- mkRecover recyclerIndex builderName
         pure Runtime.RecyclerHandle
           { Runtime.rhOnAddToBacklog = \key consumed outputs backlog ->
@@ -358,14 +360,17 @@ main = do
                   builderName backlog key consumed outputs)
           , Runtime.rhOnAddToPipe = \inputs backlog ->
               Tracing.traceWith (Tracing.trRecycler tracers)
-                (Tracing.RecyclerAddToPipe builderName builderName backlog inputs)
+                (Tracing.RecyclerAddToPipe
+                  builderName inputQueueName backlog inputs
+                )
             -- The trace keeps the dropped payloads by txId (their key), not
             -- the full transactions.
           , Runtime.rhOnReset = \droppedInputs droppedPayloads fresh backlog ->
               Tracing.traceWith (Tracing.trRecycler tracers)
                 (Tracing.RecyclerReset
-                  builderName builderName
-                  backlog (map fst droppedPayloads) droppedInputs fresh)
+                  builderName inputQueueName
+                  backlog (map fst droppedPayloads) droppedInputs fresh
+                )
           , Runtime.rhRecover = recover
           }
 

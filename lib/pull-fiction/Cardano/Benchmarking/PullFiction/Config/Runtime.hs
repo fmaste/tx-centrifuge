@@ -100,6 +100,10 @@ data Runtime key input payload = Runtime
     -- | Resolved pipes (queue pairs), keyed by name. Pure structure: the only
     -- pool whose entries do not repeat their name as a field (it lives only
     -- in the 'Map' key) and run no async, just the queue pair.
+    -- One entry per workload always, but under @\"scope\": \"shared\"@ (the
+    -- default) every entry is built over one input queue, so the entries are
+    -- distinct pipes sharing their input side (see 'Raw.InputsScope' and
+    -- 'resolvePipes').
   , pipes      :: !(Map String (Pipe.Pipe key input payload))
     -- | Resolved recyclers, keyed by name.
   , recyclers  :: !(Map String (Recycler key input payload))
@@ -236,8 +240,8 @@ data Recycler key input payload = Recycler
     -- | Optional recovery action (from 'rhRecover'): the forwarder runs it on
     -- an orphan and feeds its result to 'Recycler.reset'.
   , recyclerRecover  :: !(Maybe (IO [input]))
-    -- | Linked async running its worker (the sole writer of recycled inputs
-    -- back onto the pipe).
+    -- | Linked async running its worker (writes this workload's recycled
+    -- inputs back onto its pipe's input queue).
   , recyclerAsync    :: !(Async.Async ())
   }
 
@@ -320,43 +324,81 @@ type LimiterCache = Map String RL.RateLimiter
 -- pipe and recycler), then forwarders (each bridges an observer to a
 -- recycler). See 'Runtime' for each pool's naming.
 --
--- Initial inputs are partitioned equally across workloads (last absorbs the
--- remainder).
+-- Initial inputs all go into one input queue, which every workload draws from.
+-- Under @\"scope\": \"per_workload\"@ there is a queue per workload instead and
+-- they are split equally across them, the last queue taking the remainder (see
+-- 'Raw.InputsScope').
 resolve
   :: Ord key
   -- | Builder factory (index, name, config).
   => (Int -> String -> Raw.Builder  -> IO (BuilderHandle  key input payload))
-  -- | Pipe-events factory (index, name): the tracing handlers the pipe fires at
-  -- each queue event.
-  -> (Int -> String -> IO (PipeHandle key input))
-  -- | Recycler-events factory (index, name): the tracing handlers the recycler
-  -- fires as payloads enter the backlog and as it recycles inputs.
-  -> (Int -> String -> IO (RecyclerHandle key input payload))
+  -- | Pipe-events factory (index, workload name, input queue name): the tracing
+  -- handlers the pipe fires at each queue event. Both names are given because
+  -- the two queues are named by different things: the payload queue is the
+  -- workload's own, the input queue may be shared with other workloads.
+  -> (Int -> String -> String -> IO (PipeHandle key input))
+  -- | Recycler-events factory (index, workload name, input queue name): the
+  -- tracing handlers the recycler fires as payloads enter the backlog and as it
+  -- recycles inputs. It gets the input queue's name for the same reason the
+  -- pipe-events factory does: what it recycles into may be shared.
+  -> (Int -> String -> String -> IO (RecyclerHandle key input payload))
   -- | Observer factory (index, name, config).
   -> (Int -> String -> Raw.Observer -> IO (ObserverHandle key))
   -> Validated.Config input
   -> IO (Runtime key input payload)
 resolve mkBuilderFn mkPipeHandleFn mkRecyclerHandleFn mkObserverFn validatedConfig = do
-  let workloadsMap = Validated.workloads validatedConfig
-  -- Distribute initial inputs equally across workloads, keyed by workload name.
-  -- Both Maps share the same ascending key order, so zip + fromAscList is safe.
-  let inputsByWorkload =
-        Map.fromAscList $ zip
-          (Map.keys workloadsMap)
-          (partitionInputs
-            (Map.size workloadsMap)
-            (toList (Validated.initialInputs validatedConfig))
-          )
+  let workloadsMap  = Validated.workloads validatedConfig
+      initialInputs = toList (Validated.initialInputs validatedConfig)
+  -- The name of the one input queue the workloads share. It cannot collide with
+  -- a workload name because a workload name may not start with @\@@ (checked at
+  -- validation time), the scheme 'Validated.rateLimitKey' already uses.
+  let sharedInputQueueName = "@shared"
+  -- The input queues, decided by the scope: which one each workload uses, by
+  -- name, and what each one is loaded with at startup. An input queue is shared
+  -- by every workload whose name here is the same: all of them take from it and
+  -- all of their recyclers enqueue back into it. The name is also what the
+  -- pipe's input-queue events are reported under (it is passed to the
+  -- pipe-events factory).
+  let (inputQueueNameByWorkload, inputsByInputQueue) =
+        case Validated.initialInputsScope validatedConfig of
+          -- One queue for every workload, holding the whole load. A workload
+          -- that keeps more inputs in flight simply takes more of it.
+          Raw.InputsShared ->
+            ( Map.map (const sharedInputQueueName) workloadsMap
+            , Map.singleton sharedInputQueueName initialInputs
+            )
+          -- One queue per workload, named after it, holding an equal share of
+          -- the load (the last queue takes the remainder). Nothing is shared:
+          -- a workload only ever sees the inputs of its own queue.
+          Raw.InputsPerWorkload ->
+            ( Map.mapWithKey (\wlName _ -> wlName) workloadsMap
+            , Map.fromAscList
+                (zip (Map.keys workloadsMap)
+                     (partitionInputs (Map.size workloadsMap) initialInputs))
+            )
   -- Resolve the name-keyed pools in dependency order: each resolver takes the
   -- already-resolved pools its entries reference. Observers stand alone, a
   -- recycler needs its pipe, a builder and a workload's targets need their pipe
   -- and recycler, and a forwarder bridges an observer to a recycler.
-  resolvedObservers  <- resolveObservers  mkObserverFn (Validated.observers validatedConfig)
-  resolvedPipes      <- resolvePipes      mkPipeHandleFn inputsByWorkload workloadsMap
-  resolvedRecyclers  <- resolveRecyclers  mkRecyclerHandleFn resolvedPipes workloadsMap
-  resolvedBuilders   <- resolveBuilders   mkBuilderFn resolvedPipes resolvedRecyclers workloadsMap
-  resolvedWorkloads  <- resolveWorkloads  resolvedPipes resolvedRecyclers workloadsMap
-  resolvedForwarders <- resolveForwarders resolvedRecyclers resolvedObservers workloadsMap
+  resolvedObservers  <- resolveObservers  mkObserverFn
+                          (Validated.observers validatedConfig)
+  resolvedPipes      <- resolvePipes      mkPipeHandleFn
+                          inputQueueNameByWorkload inputsByInputQueue
+                          (Validated.payloadQueueCapacity validatedConfig)
+                          workloadsMap
+  resolvedRecyclers  <- resolveRecyclers  mkRecyclerHandleFn
+                          inputQueueNameByWorkload
+                          resolvedPipes
+                          workloadsMap
+  resolvedBuilders   <- resolveBuilders   mkBuilderFn
+                          resolvedPipes     resolvedRecyclers
+                          workloadsMap
+  resolvedWorkloads  <- resolveWorkloads
+                          resolvedPipes     resolvedRecyclers
+                          workloadsMap
+  resolvedForwarders <- resolveForwarders
+                          resolvedRecyclers resolvedObservers
+                          workloadsMap
   -- Assemble the final runtime.
   pure Runtime
     { config     = validatedConfig
@@ -444,53 +486,120 @@ resolveBuilders mkBuilderFn resolvedPipes resolvedRecyclers workloadsMap =
     (zip [0..] (Map.toAscList workloadsMap))
 
 -- | Resolve one pipe per workload into a name-keyed pool (name = workload
--- name), loading that workload's initial inputs into it. 'Pipe.mkPipe' owns all
--- queue creation and wires the caller's tracing handlers. The pipe knows
--- nothing about recycling.
+-- name), then load the initial inputs. 'Pipe.mkPipe' only assembles the pipe
+-- and wires the caller's tracing handlers. The pipe knows nothing about
+-- recycling.
+--
+-- Every queue is created here, which is where the sharing is decided. One input
+-- queue per name in 'inputsByInputQueue', so workloads mapped to the same name
+-- get the same queue and share every input in it (see 'Raw.InputsScope'). One
+-- payload queue per pipe at the given capacity, never shared: 'Pipe.mkPipe'
+-- documents what is missing before two pipes could be given the same one.
+--
+-- The load is per queue, not per pipe: a queue that several workloads share
+-- holds one undivided set of inputs and is filled once, through the pipe of the
+-- lowest-named workload on it (loading it through each sharing pipe would
+-- enqueue every input once per pipe). Which pipe does it is not observable:
+-- every pipe on a queue is given that queue's name for its input-queue events.
 resolvePipes
-  -- | Pipe-events factory (index, name): the tracing handlers the pipe fires at
-  -- each queue event.
-  :: (Int -> String -> IO (PipeHandle key input))
-  -- | Each workload's initial inputs, keyed by workload name.
+  -- | Pipe-events factory (index, workload name, input queue name): the tracing
+  -- handlers the pipe fires at each queue event.
+  :: (Int -> String -> String -> IO (PipeHandle key input))
+  -- | Name of the input queue each workload's pipe is built over, keyed by
+  -- workload name. Two workloads under one name share that queue.
+  -> Map String String
+  -- | Each input queue's initial inputs, keyed by input queue name.
   -> Map String [input]
+  -- | Capacity of each payload queue (from 'Validated.payloadQueueCapacity').
+  -> Natural
   -> Map String Validated.Workload
   -> IO (Map String (Pipe.Pipe key input payload))
-resolvePipes mkPipeHandleFn inputsByWorkload workloadsMap =
-  Map.fromAscList <$> mapM
-    (\(ix, (wlName, _validatedWorkload)) -> do
-      pipeHandle <- mkPipeHandleFn ix wlName
-      thePipe <- Pipe.mkPipe
-                   (phOnInputsEnqueued  pipeHandle)
-                   (phOnInputsDequeued  pipeHandle)
-                   (phOnPayloadEnqueued pipeHandle)
-                   (phOnPayloadDequeued pipeHandle)
-      -- Load the initial inputs one at a time through 'Pipe.addInputs', the
-      -- same call the recycler uses so each enters exactly like a recycled one.
-      mapM_
-        (\initialInput -> Pipe.addInputs thePipe [initialInput])
-        (inputsByWorkload Map.! wlName)
-      pure (wlName, thePipe)
+resolvePipes
+    mkPipeHandleFn inputQueueNameByWorkload inputsByInputQueue
+    payloadQueueCapacity workloadsMap = do
+  -- The input queues, keyed by name: an empty queue and its depth counter each.
+  inputQueues <- mapM
+    (\_initialInputs -> do
+      inputQueue <- STM.newTQueueIO
+      inputDepth <- STM.newTVarIO (0 :: Natural)
+      pure (inputQueue, inputDepth)
     )
-    -- Zero-based index and name provided to the pipe factory.
+    inputsByInputQueue
+  -- One pipe per workload, each tagged with the name of the input queue it was
+  -- built over. Both maps below are projections of this one pass, so no second
+  -- lookup can disagree with it about which queue a pipe belongs to.
+  builtPipes <- mapM
+    (\(ix, (wlName, _validatedWorkload)) -> do
+      let inputQueueName = inputQueueNameByWorkload Map.! wlName
+          (inputQueue, inputDepth) = inputQueues Map.! inputQueueName
+      -- The input queue's name goes to the factory alongside the workload's:
+      -- the input-queue events belong to the queue, which the workload may not
+      -- have to itself.
+      pipeHandle <- mkPipeHandleFn ix wlName inputQueueName
+      -- This pipe's own payload queue, the pipeline's sole backpressure.
+      payloadQueue <- STM.newTBQueueIO payloadQueueCapacity
+      let thePipe = Pipe.mkPipe
+                      inputQueue
+                      inputDepth
+                      payloadQueue
+                      (phOnInputsEnqueued  pipeHandle)
+                      (phOnInputsDequeued  pipeHandle)
+                      (phOnPayloadEnqueued pipeHandle)
+                      (phOnPayloadDequeued pipeHandle)
+      pure (wlName, inputQueueName, thePipe)
+    )
+    -- Zero-based index and both names provided to the pipe factory.
     (zip [0..] (Map.toAscList workloadsMap))
+  let -- The pool. 'builtPipes' is in ascending workload order, as it was built
+      -- from 'Map.toAscList'.
+      resolvedPipes = Map.fromAscList
+        [ (wlName, thePipe) | (wlName, _, thePipe) <- builtPipes ]
+      -- The pipe each input queue is loaded through, keyed by input queue name.
+      -- Several pipes can be built over one queue and any of them will do, as
+      -- they all report the load under that queue's name, so the first workload
+      -- on it wins: @\_later first -> first@ keeps the entry already there.
+      loaderPipes = Map.fromListWith (\_later first -> first)
+        [ (inputQueueName, thePipe)
+        | (_, inputQueueName, thePipe) <- builtPipes
+        ]
+  -- Load the initial inputs one at a time through 'Pipe.addInputs', the same
+  -- call the recycler uses so each enters exactly like a recycled one. The
+  -- lookup is total: the scope branch that keyed 'inputsByInputQueue' is the
+  -- one that named every queue in 'loaderPipes'.
+  mapM_
+    (\(inputQueueName, initialInputs) -> do
+      let loaderPipe = loaderPipes Map.! inputQueueName
+      mapM_
+        (\initialInput -> Pipe.addInputs loaderPipe [initialInput])
+        initialInputs
+    )
+    (Map.toAscList inputsByInputQueue)
+  pure resolvedPipes
 
 -- | Resolve one recycler per workload into a name-keyed pool. For each, build
--- the 'Internal.Recycler' logic and start its worker (the sole writer of
--- recycled inputs back onto the pipe). Each 'Recycler' wraps that logic with
--- its worker 'recyclerAsync', collected into 'asyncs'. The observer bridge for
+-- the 'Internal.Recycler' logic and start its worker (the thread that writes
+-- this workload's recycled inputs back onto its pipe's input queue, which the
+-- workers of other workloads also write to when that queue is shared). Each
+-- 'Recycler' wraps that logic with its worker 'recyclerAsync', collected into
+-- 'asyncs'. The observer bridge for
 -- 'RecycleOnConfirm' is resolved separately, by 'resolveForwarders'.
 resolveRecyclers
   :: Ord key
-  -- | Recycler-events factory (index, name): the tracing handlers the recycler
-  -- fires as payloads enter the backlog and as it recycles inputs.
-  => (Int -> String -> IO (RecyclerHandle key input payload))
+  -- | Recycler-events factory (index, workload name, input queue name): the
+  -- tracing handlers the recycler fires as payloads enter the backlog and as it
+  -- recycles inputs.
+  => (Int -> String -> String -> IO (RecyclerHandle key input payload))
+  -- | Name of the input queue each workload recycles into, keyed by workload
+  -- name (the same map 'resolvePipes' built its pipes from).
+  -> Map String String
   -> Map String (Pipe.Pipe key input payload)
   -> Map String Validated.Workload
   -> IO (Map String (Recycler key input payload))
-resolveRecyclers mkRecyclerHandleFn resolvedPipes workloadsMap =
+resolveRecyclers mkRecyclerHandleFn inputQueueNameByWorkload resolvedPipes workloadsMap =
   Map.fromAscList <$> mapM
     (\(ix, (wlName, _validatedWorkload)) -> do
-      recyclerHandle <- mkRecyclerHandleFn ix wlName
+      let inputQueueName = inputQueueNameByWorkload Map.! wlName
+      recyclerHandle <- mkRecyclerHandleFn ix wlName inputQueueName
       internal <- Recycler.mkRecycler
                     (resolvedPipes Map.! wlName)
                     (rhOnAddToBacklog recyclerHandle)
@@ -506,7 +615,7 @@ resolveRecyclers mkRecyclerHandleFn resolvedPipes workloadsMap =
                       }
            )
     )
-    -- Zero-based index and name provided to the recycler factory.
+    -- Zero-based index and both names provided to the recycler factory.
     (zip [0..] (Map.toAscList workloadsMap))
 
 -- | Resolve the observers into a name-keyed pool, spawning each one's 'ohRun'

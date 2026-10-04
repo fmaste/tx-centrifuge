@@ -35,7 +35,11 @@ module Cardano.Benchmarking.PullFiction.Config.Validated
   (
     -- * Config.
     Config
-  , initialInputs, inputSources, observers, workloads, startupDelaySeconds
+  , initialInputs, initialInputsScope, inputSources
+  , observers
+  , workloads
+  , payloadQueueCapacity
+  , startupDelaySeconds
 
     -- * Workload.
   , Workload
@@ -63,7 +67,7 @@ module Cardano.Benchmarking.PullFiction.Config.Validated
 ----------
 import Control.Monad (when)
 import Data.List.NonEmpty (NonEmpty)
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isJust)
 import Numeric.Natural (Natural)
 ----------------
 -- containers --
@@ -78,6 +82,17 @@ import Cardano.Benchmarking.PullFiction.Config.Raw qualified as Raw
 --------------------------------------------------------------------------------
 -- Defaults.
 --------------------------------------------------------------------------------
+
+-- | Default scope of the initial inputs when not specified in JSON: one input
+-- queue holding all of them, shared by every workload.
+-- Shared rather than split because an input belongs to no workload (it carries
+-- its own signing key), and the portion needed by a workload is its rate times
+-- the confirmation latency of the cluster under test, which a config file may
+-- not know. A wrong split starves one workload while the inputs it needs sit in
+-- queues it cannot reach. Matches 'defaultTopLevelScope', which pools the rate
+-- limit the same way.
+defaultInputsScope :: Raw.InputsScope
+defaultInputsScope = Raw.InputsShared
 
 -- | Default scope for a top-level rate limiter when not specified in JSON.
 defaultTopLevelScope :: Raw.TopLevelScope
@@ -96,6 +111,14 @@ defaultMaxBatchSize = 0
 defaultOnExhaustion :: Raw.OnExhaustion
 defaultOnExhaustion = Raw.Block
 
+-- | Default capacity of a pipe's payload queue. Bounded (unlike an input
+-- queue): the builder blocks on a full payload queue when the workers cannot
+-- consume fast enough, which is the pipeline's sole source of backpressure.
+-- Large enough to absorb GC pauses at high TPS (e.g. 100k TPS drains 8192
+-- entries in ~80 ms).
+defaultPayloadQueueCapacity :: Natural
+defaultPayloadQueueCapacity = 8192
+
 -- | Default startup delay in seconds when not specified in JSON.
 -- 0 means no delay: workers connect to targets as soon as they are spawned.
 defaultStartupDelaySeconds :: Natural
@@ -110,6 +133,10 @@ defaultStartupDelaySeconds = 0
 data Config input = Config
   { -- | Initial inputs provided by the caller and stored by 'validate'.
     initialInputs :: !(NonEmpty input)
+    -- | Resolved scope of 'initialInputs': how many input queues they are split
+    -- into, and so which workloads share one (see 'Raw.InputsScope').
+    -- Applied by 'Config.Runtime'.
+  , initialInputsScope :: !Raw.InputsScope
     -- | Input sources (keyed by name).
     -- Opaque; interpretation is the caller's responsibility.
   , inputSources  :: !(Map String Raw.InputSource)
@@ -118,6 +145,11 @@ data Config input = Config
   , observers     :: !(Map String Raw.Observer)
     -- | Workloads keyed by name. Iteration order is alphabetical (Map order).
   , workloads     :: !(Map String Workload)
+    -- | Resolved capacity of each pipe's payload queue. No JSON field feeds it
+    -- yet, so it is always 'defaultPayloadQueueCapacity'. It is resolved here
+    -- like every other default, so adding that field later cascades into the
+    -- one place 'Config.Runtime' already reads the capacity from.
+  , payloadQueueCapacity :: !Natural
     -- | Resolved startup delay in seconds with 0 meaning no delay.
     -- Consumed by the caller (see @Main.hs@).
   , startupDelaySeconds :: !Natural
@@ -258,12 +290,48 @@ validate raw inputs = do
         workload
     )
     rawWorkloads
-  -- Inputs must cover all workloads: Runtime.partitionInputs splits them into
-  -- contiguous chunks, so fewer inputs than workloads leaves some with zero.
-  let inputCount = length inputs
-  when (inputCount < Map.size workloadsMap) $
+  -- Initial inputs scope: how many input queues the inputs are split into (see
+  -- 'Raw.InputsScope'). Has a single top-level value, it does not cascade.
+  let inputsScope = fromMaybe
+                      defaultInputsScope -- Default value.
+                      (Raw.initialInputsScope (Raw.initialInputs raw))
+  -- Inputs must cover all input queues: Runtime.partitionInputs splits them
+  -- into contiguous chunks, one per queue, so fewer inputs than queues leaves
+  -- some with zero. "shared" makes one queue in total, "per_workload" one queue
+  -- per workload.
+  let inputQueueCount = case inputsScope of
+        Raw.InputsShared      -> 1
+        Raw.InputsPerWorkload -> Map.size workloadsMap
+      inputCount = length inputs
+  when (inputCount < inputQueueCount) $
     Left $ "Config: not enough initial inputs (" ++ show inputCount
-        ++ ") for " ++ show (Map.size workloadsMap) ++ " workload(s)"
+        ++ ") for " ++ show inputQueueCount ++ " input queue(s)"
+  -- A recovery and an input queue shared by more than one workload are mutually
+  -- exclusive. The recovery's reset drops every input queued on it and reseeds
+  -- from one workload's own UTxO query, so the others lose theirs for good. One
+  -- workload under "shared" is no conflict (it is alone on the queue, so drop
+  -- and reseed cover the same set), which keeps the recovery available to the
+  -- one-workload-per-node topology the optimistic strategies want. Counting all
+  -- the workloads is right because "shared" puts every one on the queue.
+  -- The recycle strategy does not enter the condition: the reset is the same
+  -- operation under every strategy, and under "on_confirm" the key only gates
+  -- whether it fires, never what it empties. It picks the advice instead, since
+  -- "on_confirm" has a second way out: dropping the recovery still leaves its
+  -- orphans recovering through the consumed inputs they released.
+  when (inputsScope == Raw.InputsShared && Map.size workloadsMap > 1) $
+    mapM_
+      (\(wlName, validatedWorkload) ->
+        when (isJust (Raw.builderRecovery (builder validatedWorkload))) $
+          Left $ "Config: workload " ++ show wlName ++ ": \"recovery\" cannot"
+              ++ " be used with \"initial_inputs\" \"scope\": \"shared\" (the"
+              ++ " default), set \"scope\": \"per_workload\""
+              ++ case Raw.builderRecycle (builder validatedWorkload) of
+                   Just (Raw.RecycleOnConfirm _) ->
+                     " or drop the \"recovery\" (with \"on_confirm\" an orphan"
+                     ++ " recovers its own consumed inputs without it)"
+                   _ -> ""
+      )
+      (Map.toAscList workloadsMap)
   -- Referential integrity of the input source and observers pools: every
   -- referenced name defined, every defined name referenced. The two pools are
   -- independent namespaces: every reference field is typed ("source" fields
@@ -280,11 +348,13 @@ validate raw inputs = do
                        (Raw.maybeStartupDelaySeconds raw)
   -- Final validated config.
   pure Config
-    { initialInputs       = inputs
-    , inputSources        = resolvedSources
-    , observers           = resolvedObservers
-    , workloads           = workloadsMap
-    , startupDelaySeconds = startupDelay
+    { initialInputs        = inputs
+    , initialInputsScope   = inputsScope
+    , inputSources         = resolvedSources
+    , observers            = resolvedObservers
+    , workloads            = workloadsMap
+    , payloadQueueCapacity = defaultPayloadQueueCapacity
+    , startupDelaySeconds  = startupDelay
     }
 
 --------------------------------------------------------------------------------

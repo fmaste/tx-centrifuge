@@ -1,5 +1,5 @@
 {
-  "initial_inputs": { "source": "test-funds" },
+  "initial_inputs": { "source": "test-funds", "scope": "per_workload" },
   "input_sources": {
     "test-funds": {
       "type": "genesis_utxo_keys",

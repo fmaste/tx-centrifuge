@@ -4,9 +4,12 @@
 --------------------------------------------------------------------------------
 
 -- | The 'Pipe': a generic pair of STM queues that moves items and nothing more.
--- It owns two private queues, an unbounded input queue (with a live depth
+-- It holds two private queues, an unbounded input queue (with a live depth
 -- counter) and a bounded payload queue, and reports every queue change through
--- four caller-supplied event handlers (e.g. for tracing).
+-- four caller-supplied event handlers (e.g. for tracing). Both queues are
+-- created by the caller and passed to 'mkPipe', which is what lets two pipes be
+-- built over one queue and share it. Only the input queue may be shared today,
+-- see 'mkPipe'.
 --
 -- Work flows input queue → builder → payload queue → worker. The 'Pipe' knows
 -- /nothing/ about recycling: the bookkeeping and the recycle loop that closes
@@ -87,16 +90,23 @@ data Pipe key input payload = Pipe
   { -- | Unbounded input queue (TQueue): must never block on write (the initial
     -- load at startup, recycle bursts at steady-state). Backpressure comes from
     -- 'pipePayloadQueue' instead.
+    -- Supplied to 'mkPipe' by the caller, not created there, so two pipes can
+    -- be given the same queue and then share every input in it (see
+    -- 'Raw.InputsScope' and 'Config.Runtime').
     pipeInputQueue        :: !(STM.TQueue input)
     -- | Live element count of 'pipeInputQueue'. ('STM.TQueue' has no O(1)
-    -- length, so we track it: starts at @0@ in 'mkPipe', @+@ on 'addInputs',
-    -- @-@ on 'takeInputs', always in the same STM transaction as the queue
-    -- itself.)
+    -- length, so we track it: @+@ on 'addInputs', @-@ on 'takeInputs', always
+    -- in the same STM transaction as the queue itself.) Supplied with the
+    -- queue it counts, so pipes sharing that queue report one depth.
   , pipeInputDepth        :: !(STM.TVar Natural)
-    -- | Bounded payload queue (capacity 'payloadQueueCapacity'). It's the sole
-    -- source of backpressure. Each element is @(key, payload)@: the key rides
-    -- along so the fetcher's caller can identify the pulled payload (e.g. for
-    -- its recycle bookkeeping) and the dequeue handler can trace it.
+    -- | Bounded payload queue. It's the sole source of backpressure: the
+    -- builder blocks on a full one when the workers cannot consume fast enough.
+    -- Each element is @(key, payload)@: the key rides along so the fetcher's
+    -- caller can identify the pulled payload (e.g. for its recycle bookkeeping)
+    -- and the dequeue handler can trace it.
+    -- Supplied by the caller like the input queue above, so is the capacity the
+    -- caller choice ('Validated.payloadQueueCapacity'). Only the input queue
+    -- may be shared today: see the second half of 'mkPipe'.
   , pipePayloadQueue      :: !(STM.TBQueue (key, payload))
     -- | Fired after inputs are added to the input queue (by 'addInputs': the
     -- caller's initial load or a recycle).
@@ -112,35 +122,44 @@ data Pipe key input payload = Pipe
 
 --------------------------------------------------------------------------------
 
--- | Capacity of 'pipePayloadQueue'. Bounded (unlike the input queue): the
--- builder blocks here when workers cannot consume fast enough, which is the
--- pipeline's sole source of backpressure. Large enough to absorb GC pauses at
--- high TPS (e.g. 100k TPS drains 8192 entries in ~80 ms).
-payloadQueueCapacity :: Natural
-payloadQueueCapacity = 8192
-
--- | Build an empty 'Pipe' with the four queue-event handlers (input enqueued\/
--- dequeued, payload enqueued\/dequeued). The only way to construct a 'Pipe', so
--- the queues and the depth counter are always created consistently.
+-- | Assemble a 'Pipe' from its two queues and the four queue-event handlers
+-- (input enqueued\/dequeued, payload enqueued\/dequeued). The only way to
+-- construct a 'Pipe'. It allocates nothing, so it is not in 'IO': the caller
+-- creates the queues, and that is what decides which of them is shared.
 --
--- The input queue starts empty. The caller loads the initial inputs afterwards
--- with 'addInputs', the same call the recycler uses, so an initial input is
--- indistinguishable from a recycled one. There is no \"initial input\" concept
--- below this call.
+-- Create the input queue empty with its depth counter at @0@, and the payload
+-- queue empty and bounded (its capacity is the caller's, see
+-- 'Validated.payloadQueueCapacity'). Hand the same input queue to several pipes
+-- and they share every input in it.
+--
+-- __Sharing a payload queue is not supported yet.__ It compiles, and two things
+-- have to be solved before it works:
+--
+--   * A dequeued payload must confirm with the recycler of the builder that
+--     made it. 'Config.Runtime' wires the dequeue to the pulling target's own
+--     workload, so a payload from another workload would confirm nothing and
+--     its inputs would never return.
+--   * 'dropPayloads' empties the whole queue, so the reset behind one
+--     workload's recovery would drop the payloads of every workload on it.
+--
+-- The caller loads the initial inputs afterwards with 'addInputs', the same
+-- call the recycler uses, so an initial input is indistinguishable from a
+-- recycled one. There is no \"initial input\" concept below this call.
 mkPipe
-  :: OnInputsEvent input -- ^ Fired after inputs are enqueued (added).
+  :: STM.TQueue input    -- ^ Input queue, empty (may be shared).
+  -> STM.TVar Natural    -- ^ Depth counter of that queue, holding @0@.
+  -> STM.TBQueue (key, payload)
+                         -- ^ Payload queue, empty and bounded.
+  -> OnInputsEvent input -- ^ Fired after inputs are enqueued (added).
   -> OnInputsEvent input -- ^ Fired after inputs are dequeued (taken).
-  -> OnPayloadEvent key -- ^ Fired after a payload is enqueued.
-  -> OnPayloadEvent key -- ^ Fired after a payload is dequeued (pulled).
-  -> IO (Pipe key input payload)
-mkPipe onInputEnqueued onInputDequeued onPayloadEnqueued onPayloadDequeued = do
-  -- Input queue: unbounded (TQueue) so loading and recycling never block.
-  -- It starts empty, the caller must load (initial) inputs through 'addInputs'.
-  inputQueue <- STM.newTQueueIO
-  inputDepth <- STM.newTVarIO (0 :: Natural)
-  -- Payload queue: bounded (see 'payloadQueueCapacity'), the sole backpressure.
-  payloadQueue <- STM.newTBQueueIO payloadQueueCapacity
-  pure Pipe
+  -> OnPayloadEvent key  -- ^ Fired after a payload is enqueued.
+  -> OnPayloadEvent key  -- ^ Fired after a payload is dequeued (pulled).
+  -> Pipe key input payload
+mkPipe
+  inputQueue inputDepth payloadQueue
+  onInputEnqueued onInputDequeued
+  onPayloadEnqueued onPayloadDequeued =
+  Pipe
     { -- STM fields.
       pipeInputQueue        = inputQueue
     , pipeInputDepth        = inputDepth
@@ -179,6 +198,11 @@ addInputs pipe inputs = when (not (null inputs)) $ do
 -- the resulting input-queue depth outside STM.
 -- Blocking here is the intended backpressure when inputs are scarce (e.g. all
 -- in flight).
+--
+-- On a shared input queue the builders compete for the same inputs: each takes
+-- what its own rate demands, and all of them block once the queue runs dry.
+-- One transaction takes the whole batch, so a builder asking for a large @n@
+-- keeps blocking while a builder asking for a small one still succeeds.
 takeInputs :: Pipe key input payload -> Natural -> IO [input]
 takeInputs pipe n = do
   (inputs, inputDepth) <- STM.atomically $ do
@@ -202,6 +226,10 @@ takeInputs pipe n = do
 -- the reset primitive: a caller that has learned its queued inputs are stale
 -- (e.g. a rollback invalidated them) drops them here, then reseeds the queue
 -- with 'addInputs'.
+--
+-- On a shared input queue it empties that queue for every pipe built over it,
+-- which is why a builder recovery (the only user of this reset) and a shared
+-- input queue are rejected together by 'Config.Validated'.
 dropInputs :: Pipe key input payload -> IO [input]
 dropInputs pipe = do
   inputs <- STM.atomically $ do

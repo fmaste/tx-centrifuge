@@ -48,21 +48,18 @@ The underlying `pull-fiction` library implements a reactive rate-limiting strate
                                     │ Initial UTxOs │
                                     └───────┬───────┘
                                             │
-                                      (partitioned)
-                                            │
-              ┌─────────────────────────────┼─────────────────────────────┐
+                                            ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                               Input Queue (unbounded)                               │
+│              one queue for every workload: any builder takes from it,               │
+│                        every recycler returns outputs to it                         │
+└─────────────┬─────────────────────────────┬─────────────────────────────┬───────────┘
               │                             │                             │
               ▼                             ▼                             ▼
 ┌─────────────────────────┐   ┌─────────────────────────┐   ┌─────────────────────────┐
 │       Workload A        │   │       Workload B        │   │       Workload N        │
 ├─────────────────────────┤   ├─────────────────────────┤   ├─────────────────────────┤
 │                         │   │                         │   │                         │
-│   ┌─────────────────┐   │   │   ┌─────────────────┐   │   │   ┌─────────────────┐   │
-│   │   Input Queue   │   │   │   │   Input Queue   │   │   │   │   Input Queue   │   │
-│   │   (unbounded)   │   │   │   │   (unbounded)   │   │   │   │   (unbounded)   │   │
-│   └────────┬────────┘   │   │   └────────┬────────┘   │   │   └────────┬────────┘   │
-│            │            │   │            │            │   │            │            │
-│            ▼            │   │            ▼            │   │            ▼            │
 │   ┌─────────────────┐   │   │   ┌─────────────────┐   │   │   ┌─────────────────┐   │
 │   │     Builder     │   │   │   │     Builder     │   │   │   │     Builder     │   │
 │   │ (build & sign)  │   │   │   │ (build & sign)  │   │   │   │ (build & sign)  │   │
@@ -89,18 +86,18 @@ The underlying `pull-fiction` library implements a reactive rate-limiting strate
 │  │Node 1│   │Node 2│    │   │  │Node 3│   │Node 4│    │   │  │Node 5│   │Node 6│    │
 │  └──────┘   └──────┘    │   │  └──────┘   └──────┘    │   │  └──────┘   └──────┘    │
 │                         │   │                         │   │                         │
-│  ◄── recycle outputs ───┤   │  ◄── recycle outputs ───┤   │  ◄── recycle outputs ───┤
+│ outputs ──► Input Queue │   │ outputs ──► Input Queue │   │ outputs ──► Input Queue │
 │                         │   │                         │   │                         │
 └─────────────────────────┘   └─────────────────────────┘   └─────────────────────────┘
 ```
 
 **Pipeline flow:**
-1. **Initial UTxOs** are loaded and **partitioned** across workloads
-2. Each workload's share enters its **Input Queue** (unbounded)
+1. **Initial UTxOs** are loaded into one **Input Queue** (unbounded), shared by every workload
+2. Any workload can take any input, since a fund carries the signing key that spends it and so belongs to no workload. Give each workload its own queue instead with [`"scope": "per_workload"`](#input-scope-scope)
 3. A **Builder** (one per workload) pulls inputs, assembles and signs transactions, and pushes `(tx, outputs)` to the **Payload Queue** (bounded — sole source of backpressure)
 4. **Workers** (one per target) pull from the Payload Queue via rate-limited fetchers
 5. Workers connect to Cardano nodes via a **multiplexed NodeToNode** connection running **TxSubmission2** and **KeepAlive** mini-protocols (optionally **ChainSync** + **BlockFetch** for confirmation-based recycling)
-6. **Outputs are recycled** back to the workload's Input Queue according to the configured `recycle` strategy, enabling indefinite-duration runs
+6. **Outputs are recycled** back to the Input Queue according to the configured `recycle` strategy, enabling indefinite-duration runs
 
 ### Reactive Rate Limiting
 - **Downstream Driven**: Load is only dispensed in response to an explicit pull from a target. If the target doesn't ask, the engine stays idle.
@@ -118,14 +115,14 @@ The configuration is organized into a hierarchy that defines the concurrency mod
 
 ### Pipeline Architecture
 The engine operates as a decoupled production pipeline using generic `input` and `payload` types:
-1.  **Initial Inputs**: Starting resources are partitioned across workloads and bulk-loaded into each workload's Input Queue at startup.
-2.  **Input Queue (Unbounded)**: Holds available inputs.
+1.  **Initial Inputs**: Starting resources are bulk-loaded into the Input Queue at startup, one queue shared by every workload unless the config asks for one per workload (see [Input scope](#input-scope-scope)).
+2.  **Input Queue (Unbounded)**: Holds available inputs. Every builder on it takes from it and every recycler returns to it.
 3.  **Builder (One per Workload)**: A dedicated thread that pulls inputs, produces a payload, and handles recycling according to the configured strategy (see [Resource Recycling](#resource-recycling)). It pushes the payload to the payload queue.
 4.  **Payload Queue (Bounded)**: The sole source of **backpressure**. The builder blocks here if consumers are slower than the production rate.
 5.  **Workers (One per Target)**: Threads that manage the consumer connection. They pull from the payload queue via a rate-limited fetcher.
 
 ### Resource Recycling
-To enable indefinite-duration runs with finite resources, inputs must be returned to the `Input Queue`. The `recycle` field on the `builder` selects when this happens. There are three strategies:
+To enable indefinite-duration runs with finite resources, inputs must be returned to the `Input Queue` (the shared one, or the workload's own under `"scope": "per_workload"`). The `recycle` field on the `builder` selects when this happens. There are three strategies:
 
 1.  **`on_build`** — Resources return to the `Input Queue` as soon as the payload is constructed: the build itself counts as the confirmation, so the recycler releases the outputs right away (an `AddToBacklog` and an `AddToPipe` trace per payload). This is the highest-throughput mode but assumes the payload will be successfully processed downstream.
     ```json
@@ -160,6 +157,8 @@ The `source` must name a `utxo_query` entry in the top-level [`input_sources`](#
   "my-node-utxo": { "type": "utxo_query", "params": { "socket_path": "node.socket" } }
 }
 ```
+With more than one workload configured, a `recovery` requires `"initial_inputs"` `"scope": "per_workload"` (see [Input scope](#input-scope-scope)), because its reset empties one input queue and refills it from one builder's destination addresses: on the default shared queue that would discard every other workload's queued inputs. Setting both is a startup error. A single workload needs no such setting, being alone on the queue, which is the topology the optimistic strategies want anyway. With `on_confirm` there is a second way out: drop the `recovery` and keep the shared queue, since an `on_confirm` orphan without a recovery already returns that transaction's own consumed inputs to the queue. What you lose is the flush that covers a confirm followed by a rollback, where the payload has already been released and its recycled outputs stay queued.
+
 With a `recovery`, an orphan event from the named observer no longer recovers just that transaction's consumed inputs: the recycler drops every queued input (potentially poisoned by the rollback), drops every queued payload built from those inputs (equally stale: they either descend from orphaned transactions or double-spend the lineage the reseed restarts), and reseeds the input queue from chain truth, querying the UTxOs currently at the builder's destination address through the source's NodeToClient `socket_path`. The observer and the source are independent: any observer type works, and the source's socket may point at a different node than the one the observer follows. The observer stays an independent shared entity: builders with and without a `recovery` can name the same observer, each with its own pipeline, and every observer connection runs once no matter how many builders or purposes reference it. A subscription delivers the observer's full stream, and the workload takes what applies to its strategy (for `on_confirm`, a different `recovery` observer's confirms also count as confirmations). An explicitly named observer is always subscribed, so explicitly repeating the confirm observer creates a second subscription with each event delivered twice: duplicate orphans are ignored or rerun an idempotent reseed, and duplicate confirms are ignored (the payload is no longer held). The socket is probed once at startup, so a wrong `socket_path` fails immediately rather than at the first rollback. At runtime a failed query is reported and retried every second until it succeeds; the builder keeps building from the stale queue meanwhile (payloads delivered in that window fail harmlessly downstream, the rest are flushed by the reset) and the reset replaces the queue once the query lands, traced as `TxCentrifuge.Recycler.Reset`. One rollback triggers one recovery. Under `on_confirm` the reset is additionally **keyed**: the recycler applies it only while the orphaned transaction is still held awaiting its confirm, so an orphan of a *foreign* transaction (the observer stream is unfiltered) or a duplicate delivery is ignored and no reset happens — foreign traffic cannot reset an `on_confirm` recovery, and a rollback's orphan burst collapses at that gate (at one recovery query per orphan event). Under `on_build` and `on_pull` the orphaned transaction was already released at build or dequeue, so the reset cannot be gated: it applies on any settled orphan, foreign or not, and the orphan events that accumulate while the recovery runs are discarded.
 
 This is what makes the optimistic strategies (`on_build`, `on_pull`) safe to run with few funds (down to a single one): transactions are allowed to fail in the window between submission and confirmation, and the recovery resets the input queue to chain truth when a rollback invalidates them, instead of provisioning enough funds to keep every in-flight transaction valid.
@@ -242,6 +241,30 @@ The generator requires a set of initial UTxOs, loaded through a named input sour
 
 Loading through a `utxo_query` source makes restarts **stateless**: each builder recycles its outputs back to its `destination_signing_key` address, so pointing the `signing_keys` at those same keys re-discovers whatever a previous run left on chain. If no UTxOs are found at any queried address, the generator exits with an error rather than starting. Fund the address of at least one configured `signing_keys` entry and restart.
 
+#### Input scope (`scope`)
+`initial_inputs` takes an optional **`scope`** that says how many input queues the loaded inputs are split into:
+
+| `scope` | Input queues | Who draws from each |
+|---------|--------------|---------------------|
+| `shared` (default) | One for all the workloads, holding every input | All of them: every workload takes from that queue and every recycler enqueues back into it |
+| `per_workload` | One per workload, each holding an equal share of the inputs | Only its own workload: it takes from that queue and recycles back into it |
+
+Inputs are fungible, since a fund carries the signing key needed to spend it, so any workload can use any fund. That is why `shared` is the default: a split has to be sized for the workload that keeps the most inputs in flight, which is its rate times the confirmation latency of the cluster under test, and a config file cannot know that figure. Get it wrong and one workload starves while the inputs it needs sit in queues it cannot reach.
+
+Pick `per_workload` when a run needs each workload's input supply to be independent of the others, and whenever a builder uses a [`recovery`](#rollback-recovery-recovery) (required, see below).
+
+What `shared` means in practice:
+
+- The builders compete for the same inputs. One transaction takes a whole batch, so while the queue is low a workload with a large `inputs_per_tx` keeps waiting whenever workloads with a small one can still build.
+- `TxCentrifuge.Pipe.Inputs{Enqueued,Dequeued}` report the shared queue, so their `pipe` field is `@shared` instead of a workload name and their `depth` is that queue's depth. The payload events (`PayloadEnqueued`, `PayloadDequeued`) keep the workload's name, since a payload queue is never shared. The startup load arrives as one run of `InputsEnqueued` under `@shared`, a shared queue being filled once.
+- A builder [`recovery`](#rollback-recovery-recovery) is a validation error once a second workload exists, so a config that uses one must then set `"scope": "per_workload"`. A recovery drops every input queued for the workload that triggered it and reseeds the queue from that workload's own UTxO query, which on a shared queue would discard the inputs of all the others and replace them with the funds of one.
+- Fund sizes mix. A workload with several `outputs_per_tx` splits the value of each fund it spends, and under `shared` those smaller funds reach every other workload too, so all of them converge on the same fund sizes.
+- `on_exhaustion: error` fires when the run as a whole runs out of inputs, not when one workload's share does.
+
+```json
+"initial_inputs": { "source": "genesis-funds", "scope": "per_workload" }
+```
+
 ### Rate Limiting (`rate_limit`)
 The `rate_limit` field can be set at the **top level** or at the **workload level** (but not both — setting it at both levels is a validation error). If omitted entirely, targets run **unlimited** (no rate ceiling).
 
@@ -265,7 +288,7 @@ Most configuration fields can be set at multiple levels. The most specific value
 - **`max_batch_size`**: target > workload > top-level > **0 (unlimited)**.
 - **`on_exhaustion`**: target > workload > top-level > **`block`**.
 
-Workload, target, observer, and input source names must be non-empty, must not start with `@`, and must not contain `.` or `/` (`@` and `.` are reserved for internal rate-limiter cache keys, `/` for the forwarder pool's wiring-path keys).
+Workload, target, observer, and input source names must be non-empty, must not start with `@`, and must not contain `.` or `/` (`@` and `.` are reserved for internal rate-limiter cache keys and for the shared input queue's name `@shared`, `/` for the forwarder pool's wiring-path keys).
 
 ### Batching and Flow Control
 - **`max_batch_size`**: Limits the number of items (e.g., transactions) the generator will announce to a target in a single protocol request. **0 means unlimited** (use whatever the node requests). Defaults to 0.
@@ -330,13 +353,13 @@ and `maxFrequency` (a cap in messages per second). The application-level traces
 | Namespace | What it reports | Detail levels |
 | :--- | :--- | :--- |
 | `TxCentrifuge.Builder.NewTx` | A new transaction was built from input UTxOs, producing output UTxOs. Carries the builder name and the TxId. Fires once per built transaction. | `DDetailed` adds the `inputs`/`outputs` as UTxO reference strings. `DMaximum` renders each fund in full (`utxo` + `lovelace`) and adds the `destination` address the tx pays to. |
-| `TxCentrifuge.Pipe.InputsEnqueued` | Inputs were added to a pipe's input queue (initial funds or recycled ones). Carries the pipe name and the resulting queue `depth`. | `DDetailed` adds a `count` of the inputs. `DMaximum` adds the `inputs` array, each fund with its `utxo` reference and `lovelace` value. |
-| `TxCentrifuge.Pipe.InputsDequeued` | Inputs were taken off the input queue for the builder. Carries the pipe name and the resulting queue `depth`. | `DDetailed` adds a `count` of the inputs. `DMaximum` adds the `inputs` array, each fund with its `utxo` reference and `lovelace` value. |
+| `TxCentrifuge.Pipe.InputsEnqueued` | Inputs were added to a pipe's input queue (initial funds or recycled ones). Carries the input queue's name (see [`scope`](#input-scope-scope)) and the resulting queue `depth`. | `DDetailed` adds a `count` of the inputs. `DMaximum` adds the `inputs` array, each fund with its `utxo` reference and `lovelace` value. |
+| `TxCentrifuge.Pipe.InputsDequeued` | Inputs were taken off the input queue for the builder. Carries the input queue's name (see [`scope`](#input-scope-scope)) and the resulting queue `depth`. | `DDetailed` adds a `count` of the inputs. `DMaximum` adds the `inputs` array, each fund with its `utxo` reference and `lovelace` value. |
 | `TxCentrifuge.Pipe.PayloadEnqueued` | A payload was added to the bounded payload queue. Carries the pipe name and the resulting queue `depth`. | `DMaximum` adds the payload's `txId` (payload events carry no `count`). |
 | `TxCentrifuge.Pipe.PayloadDequeued` | A payload was pulled off the payload queue by a worker. Carries the pipe name and the observed queue `depth`. | `DMaximum` adds the payload's `txId` (payload events carry no `count`). |
 | `TxCentrifuge.Recycler.AddToBacklog` | A payload's entry was added to the recycler's backlog: its key and its two input sets, held until a release (a confirm or an orphan) picks one. Carries the recycler name and the resulting `backlog` (the number of payloads held but not yet released). | `DDetailed` adds a `consumed_count` and an `outputs_count`. `DMaximum` adds the payload's `txId` and the `consumed` and `outputs` arrays, each fund with its `utxo` reference and `lovelace` value. |
-| `TxCentrifuge.Recycler.AddToPipe` | The recycler added a held payload's inputs back onto a pipe's input queue (via `Pipe.addInputs`), closing the loop. Carries the recycler name, the pipe name, and the resulting `backlog`. | `DDetailed` adds a `count` of the recycled inputs. `DMaximum` adds the `inputs` array, each fund with its `utxo` reference and `lovelace` value. |
-| `TxCentrifuge.Recycler.Reset` | The recycler reset a pipe for a builder's `recovery`: the queued inputs and the queued payloads built from them were dropped, and the input queue was reseeded from chain truth. Carries the recycler name, the pipe name, and the resulting `backlog` (always 0, a reset clears the backlog). Severity `Warning`. | `DDetailed` adds a `count` of the fresh inputs, a `dropped_inputs_count` and a `dropped_payloads_count`. `DMaximum` adds the `inputs` (fresh) and `dropped_inputs` arrays (each fund with its `utxo` reference and `lovelace` value) and the `dropped_payloads` array of txIds. |
+| `TxCentrifuge.Recycler.AddToPipe` | The recycler added a held payload's inputs back onto a pipe's input queue (via `Pipe.addInputs`), closing the loop. Carries the recycler name, the input queue's name, and the resulting `backlog`. | `DDetailed` adds a `count` of the recycled inputs. `DMaximum` adds the `inputs` array, each fund with its `utxo` reference and `lovelace` value. |
+| `TxCentrifuge.Recycler.Reset` | The recycler reset a pipe for a builder's `recovery`: the queued inputs and the queued payloads built from them were dropped, and the input queue was reseeded from chain truth. Carries the recycler name, the input queue's name, and the resulting `backlog` (always 0, a reset clears the backlog). Severity `Warning`. | `DDetailed` adds a `count` of the fresh inputs, a `dropped_inputs_count` and a `dropped_payloads_count`. `DMaximum` adds the `inputs` (fresh) and `dropped_inputs` arrays (each fund with its `utxo` reference and `lovelace` value) and the `dropped_payloads` array of txIds. |
 | `TxCentrifuge.Observer.Announce` | The observer saw a transaction confirmed or orphaned (rolled back), carrying the observer name, the TxId, and an `isOrphan` flag. Fires only for confirmation-based workloads, but there it is currently **unfiltered**: it reports every transaction in the confirmed blocks its node sees, not just this generator's, so its volume is roughly the whole chain's throughput. | All fields are shown at every level. |
 | `TxCentrifuge.TxSubmission.RequestTxIds` | The node requested TxId announcements (blocking or non-blocking). Carries the `target` node and the ACK and REQ counts. | `DDetailed` and up add the list of currently unacked TxIds. |
 | `TxCentrifuge.TxSubmission.ReplyTxIds` | We replied with TxId announcements and their sizes. Carries the `target`. | `DDetailed` and up add the ACK and REQ counts, the announced TxIds with sizes, and the updated unacked list. |
@@ -397,7 +420,7 @@ accordingly (e.g. 270 vs 371 bytes for 2-in/2-out). Startup announces:
 Builder group-A: destination addresses addr_test1..., addr_test1...
 ```
 - `recycle` (optional): Controls when output UTxOs are returned to the input queue. See [Resource Recycling](#resource-recycling) for the three strategies (`on_build`, `on_pull`, `on_confirm`). When omitted, outputs are **not recycled** — the generator consumes initial funds and eventually exhausts them.
-- `recovery` (optional): Rollback recovery for this builder, resetting its input queue from an input source when an observer reports one of its transactions orphaned. Requires `recycle`. See [Rollback recovery](#rollback-recovery-recovery).
+- `recovery` (optional): Rollback recovery for this builder, resetting its input queue from an input source when an observer reports one of its transactions orphaned. With more than one workload, requires [`"scope": "per_workload"`](#input-scope-scope). Requires `recycle`. See [Rollback recovery](#rollback-recovery-recovery).
 
 ## Usage
 

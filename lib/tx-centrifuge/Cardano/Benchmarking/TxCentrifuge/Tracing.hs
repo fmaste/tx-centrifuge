@@ -454,9 +454,16 @@ renderFundTxIns = Text.intercalate "," . map (Api.renderTxIn . Fund.fundTxIn)
 
 -- | Pipe queue events. The pipe reports depth changes on its two queues as
 -- items are added or removed but nothing about how a transaction was built or
--- confirmed. The 'String' is the pipe name (the JSON key is @\"pipe\"@ that is
--- currently one pipe per workload, so it is 'Runtime.builderName', but that is
--- not guaranteed to stay one-to-one).
+-- confirmed. The 'String' names the queue the event happened on (the JSON key
+-- is @\"pipe\"@): the input queue for @Inputs*@, the payload queue for
+-- @Payload*@.
+-- A payload queue belongs to one workload, so its name is that workload's
+-- ('Runtime.builderName'). An input queue may be shared: under
+-- @\"initial_inputs\"@ @\"scope\": \"shared\"@, the default, there is a single
+-- input queue named @\@shared@ holding the inputs of every workload, and the
+-- @Inputs*@ events carry that name and that queue's depth. Under
+-- @\"per_workload\"@ each workload has its own, named after it, so both names
+-- are the same.
 data PipeTrace
   = -- | Inputs were added to the input queue. 'Natural' is the input-queue
     -- depth right after. @[Fund.Fund]@ is the inputs added (their count is
@@ -573,10 +580,12 @@ instance Logging.LogFormatting PipeTrace where
 -- (closing the loop). It reports each add of a payload's entry to its
 -- backlog ('RecyclerAddToBacklog': the key and both input sets), each add of
 -- inputs to a pipe ('RecyclerAddToPipe': which inputs were added, by which
--- recycler, into which pipe) and each reset of a pipe ('RecyclerReset'). The
+-- recycler, into which queue) and each reset of a pipe ('RecyclerReset'). The
 -- 'String' names are the recycler and (on 'RecyclerAddToPipe' and
--- 'RecyclerReset') the pipe (currently both the workload name, but recorded
--- separately as that mapping is not guaranteed to stay one-to-one). The
+-- 'RecyclerReset') the input queue it recycles into, which is why they are
+-- recorded separately: one recycler per workload, but the input queue can be
+-- shared (see 'PipeTrace' for the names and
+-- 'Cardano.Benchmarking.PullFiction.Config.Raw.InputsScope' for the scope). The
 -- 'Natural' is the resulting backlog size.
 data RecyclerTrace
   = -- | A payload's entry was added to the backlog: its key and its two
@@ -587,7 +596,7 @@ data RecyclerTrace
     -- at 'Logging.DMaximum').
     RecyclerAddToBacklog !String !Natural !Api.TxId [Fund.Fund] [Fund.Fund]
     -- | Recycled inputs were added back onto a pipe's input queue. First
-    -- 'String' is the recycler name, second 'String' the pipe name, 'Natural'
+    -- 'String' is the recycler name, second 'String' the input queue, 'Natural'
     -- the resulting backlog size, @[Fund.Fund]@ the added inputs (count at
     -- 'Logging.DDetailed' and above, full data at 'Logging.DMaximum').
   | RecyclerAddToPipe !String !String !Natural [Fund.Fund]
@@ -595,11 +604,11 @@ data RecyclerTrace
     -- discarded, the payloads built from them were dropped from the payload
     -- queue, and the input queue was reseeded with fresh inputs (a builder's
     -- recovery). First 'String' is the recycler name, second 'String' the
-    -- pipe name, 'Natural' the resulting backlog size (always @0@,
-    -- a reset clears the backlog), @[Api.TxId]@ the dropped queued payloads
-    -- by txId, first @[Fund.Fund]@ the dropped inputs, second the fresh ones
-    -- added to the queue (counts at 'Logging.DDetailed' and above, full data
-    -- at 'Logging.DMaximum').
+    -- input queue, 'Natural' the resulting backlog size (always @0@, a reset
+    -- clears the backlog), @[Api.TxId]@ the dropped queued payloads by txId,
+    -- first @[Fund.Fund]@ the dropped inputs, second the fresh ones added to
+    -- the queue (counts at 'Logging.DDetailed' and above, full data at
+    -- 'Logging.DMaximum').
   | RecyclerReset     !String !String !Natural [Api.TxId] [Fund.Fund] [Fund.Fund]
 
 -- | Namespaces: @TxCentrifuge.Recycler.{AddToBacklog, AddToPipe, Reset}@.

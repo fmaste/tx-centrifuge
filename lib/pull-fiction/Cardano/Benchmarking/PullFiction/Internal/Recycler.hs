@@ -24,9 +24,12 @@
 --
 -- What to call and when, per recycle strategy, is wiring that lives entirely in
 -- 'Config.Runtime'. The recycle worker ('runRecycler') reads the queue on its
--- own thread, keeps the backlog (the held input sets) in its own /local/ map,
--- and is the sole writer to the pipe's input queue (which is what will later
--- let it shuffle a drained batch), so no shared or locked state is needed.
+-- own thread and keeps the backlog (the held input sets) in its own /local/
+-- map, so no shared or locked state is needed. It is the only thread that
+-- writes recycled inputs to its pipe's input queue, but not the only writer of
+-- that queue: when workloads share one input queue (see 'Raw.InputsScope') the
+-- worker of every workload on it writes there too, and 'Pipe.addInputs' keeps
+-- each write atomic.
 --
 -- The worker emits one observable event per action family for tracing:
 -- /AddToBacklog/ each time it adds a payload's entry to the backlog

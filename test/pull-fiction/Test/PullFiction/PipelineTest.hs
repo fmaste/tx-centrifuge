@@ -44,7 +44,8 @@ pipelineTests dur = Tasty.testGroup "pipeline"
   -- ----------------------------------------------------
   --
   -- 50 workloads, each with 1 target at 1 TPS (50 TPS aggregate).
-  -- Each workload has its own input queue; recycled inputs must return to the
+  -- The config asks for "initial_inputs": { "scope": "per_workload" }, so each
+  -- workload has its own input queue; recycled inputs must return to the
   -- originating workload's queue and never leak to another group.
   --
   -- Inputs are tagged with (workloadIndex, inputIndex) tuples. If any worker
@@ -55,5 +56,22 @@ pipelineTests dur = Tasty.testGroup "pipeline"
       "Multi-group pipeline isolation (50 groups x 1 TPS, 10s)" $ do
       path <- Paths.getDataFileName "data/config-multi-group.json"
       Harness.runPipelineIsolationTest path 50 10
+
+  -- Pipeline test 3: multi-group, one shared input queue.
+  -- ----------------------------------------------------
+  --
+  -- The same shape as test 2 but with 3 workloads and
+  -- "initial_inputs": { "scope": "shared" }, which puts every input in one
+  -- queue instead of a queue per workload.
+  --
+  -- Inputs carry the same (workloadIndex, inputIndex) tags, so here a workload
+  -- is expected to work on another workload's inputs: the test fails if no
+  -- workload ever observes a foreign tag, the exact result the per-queue
+  -- partition of test 2 gives.
+
+  , HUnit.testCase
+      "Shared input queue (3 groups x 1 TPS, 10s)" $ do
+      path <- Paths.getDataFileName "data/config-shared-inputs.json"
+      Harness.runSharedInputsTest path 3 10
 
   ]

@@ -23,6 +23,7 @@ data-files:       data/config-shared-10.json
                   data/config-per-target-2k.json
                   data/config-per-target-200.json
                   data/config-multi-group.json
+                  data/config-shared-inputs.json
 
 --------------------------------------------------------------------------------
 

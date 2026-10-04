@@ -26,6 +26,8 @@ module Cardano.Benchmarking.PullFiction.Config.Raw
 
     -- * Inputs.
   , InitialInputs (..)
+    -- ** InputsScope.
+  , InputsScope (..)
   , InputSource (..)
 
     -- * Observer.
@@ -151,15 +153,48 @@ data InitialInputs = InitialInputs
     initialInputsSource :: !String
     -- | Optional opaque params for the load (e.g. which signing keys).
   , initialInputsParams :: !(Maybe Aeson.Value)
+    -- | Optional @\"scope\"@: how many input queues the loaded inputs are
+    -- split into.
+  , initialInputsScope :: !(Maybe InputsScope)
   }
   deriving (Show, Eq)
 
 instance Aeson.FromJSON InitialInputs where
   parseJSON = Aeson.withObject "InitialInputs" $ \o -> do
-    noUnknownFields "InitialInputs" o ["source", "params"]
+    noUnknownFields "InitialInputs" o ["source", "params", "scope"]
     InitialInputs
       <$> o .:  "source"
       <*> o .:? "params"
+      <*> o .:? "scope"
+
+-- | How many input queues the initial inputs are split into, which is also what
+-- decides whether two workloads share one queue.
+-- Inputs are fungible: an input carries everything a builder needs to use it,
+-- so any workload can take any input. What the scope changes is only how many
+-- queues exist and who draws from each.
+data InputsScope
+  -- | One input queue for all the workloads, holding every initial input. Each
+  -- workload takes from it at its own rate and every recycler enqueues back
+  -- into it, so a workload that keeps many more inputs in flight than the
+  -- others draws what it needs without a share sized for it in advance.
+  = InputsShared
+  -- | One input queue per workload, each holding an equal share of the initial
+  -- inputs. A workload takes only from its own queue and recycles only into it,
+  -- so each workload must be given a share large enough for the number of
+  -- inputs it keeps in flight, and a workload cannot be starved by another's
+  -- demand. Required by a builder @recovery@ once there is more than one
+  -- workload, because its reset empties one input queue and refills it from one
+  -- builder's addresses.
+  | InputsPerWorkload
+  deriving (Show, Eq)
+
+instance Aeson.FromJSON InputsScope where
+  parseJSON = Aeson.withText "InputsScope" $ \t -> case t of
+    "shared"       -> pure InputsShared
+    "per_workload" -> pure InputsPerWorkload
+    _              -> fail $
+      "InitialInputs: expected \"scope\" \"shared\" or \"per_workload\", got "
+        ++ show t
 
 -- | Opaque input source configuration: a way to obtain inputs, referenced by
 -- @initial_inputs@ (the startup load) and by builder recoveries (rebuilding
