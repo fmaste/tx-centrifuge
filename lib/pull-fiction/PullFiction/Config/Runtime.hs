@@ -5,7 +5,7 @@
 -- | Resolves a 'Validated.Config' into a 'Runtime': live STM resources (queues,
 -- rate limiters) grouped into name-keyed pools, with the threads running them.
 -- See 'Runtime' for the pools and 'resolve' for resolution.
-module Cardano.Benchmarking.PullFiction.Config.Runtime
+module PullFiction.Config.Runtime
   ( -- * Runtime.
     Runtime
   , config, builders, pipes, recyclers, observers, forwarders, workloads, asyncs
@@ -71,11 +71,11 @@ import Control.Concurrent.STM qualified as STM
 ------------------
 -- pull-fiction --
 ------------------
-import Cardano.Benchmarking.PullFiction.Config.Raw qualified as Raw
-import Cardano.Benchmarking.PullFiction.Config.Validated qualified as Validated
-import Cardano.Benchmarking.PullFiction.Internal.Pipe qualified as Pipe
-import Cardano.Benchmarking.PullFiction.Internal.RateLimiter qualified as RL
-import Cardano.Benchmarking.PullFiction.Internal.Recycler qualified as Recycler
+import PullFiction.Config.Raw qualified as Raw
+import PullFiction.Config.Validated qualified as Validated
+import PullFiction.Internal.Pipe qualified as Pipe
+import PullFiction.Internal.RateLimiter qualified as RL
+import PullFiction.Internal.Recycler qualified as Recycler
 
 --------------------------------------------------------------------------------
 
@@ -831,7 +831,7 @@ resolveWorkloads resolvedPipes resolvedRecyclers workloadsMap = do
 -- loop.
 --
 -- Cascading defaults and conflict checks have already been performed by
--- "Cardano.Benchmarking.PullFiction.Config.Validated". This function only
+-- "PullFiction.Config.Validated". This function only
 -- creates rate limiters and fetchers.
 resolveWorkload
   :: Validated.Workload

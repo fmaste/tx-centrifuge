@@ -16,7 +16,7 @@
 -- @System.Clock@ directly cannot accidentally pass its timestamps to functions
 -- expecting this module's 'TimeSpec', and vice versa.
 
-module Cardano.Benchmarking.PullFiction.Clock
+module PullFiction.Clock
   ( -- * Types.
     TimeSpec
     -- * Reading the clock.

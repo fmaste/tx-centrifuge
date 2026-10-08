@@ -106,16 +106,16 @@ import Data.Text qualified as Text
 -- transformers --
 ------------------
 import Control.Monad.Trans.Except (runExceptT)
-------------------
--- pull-fiction --
-------------------
-import Cardano.Benchmarking.PullFiction.Config.Raw qualified as Raw
-import Cardano.Benchmarking.PullFiction.Config.Runtime qualified as Runtime
-import Cardano.Benchmarking.PullFiction.Config.Validated qualified as Validated
-import Cardano.Benchmarking.PullFiction.WorkloadRunner (runWorkload)
--------------------
--- tx-centrifuge --
--------------------
+--------------------------------
+-- tx-centrifuge:pull-fiction --
+--------------------------------
+import PullFiction.Config.Raw qualified as Raw
+import PullFiction.Config.Runtime qualified as Runtime
+import PullFiction.Config.Validated qualified as Validated
+import PullFiction.WorkloadRunner (runWorkload)
+---------------------------
+-- tx-centrifuge:cardano --
+---------------------------
 import Cardano.Benchmarking.TxCentrifuge.Block qualified as Block
 import Cardano.Benchmarking.TxCentrifuge.NodeToClient qualified as N2C
 import Cardano.Benchmarking.TxCentrifuge.NodeToClient.TxIdSync
@@ -130,6 +130,11 @@ import Cardano.Benchmarking.TxCentrifuge.NodeToNode.TxSubmission
 import Cardano.Benchmarking.TxCentrifuge.Fund qualified as Fund
 import Cardano.Benchmarking.TxCentrifuge.Tracing qualified as Tracing
 import Cardano.Benchmarking.TxCentrifuge.TxAssembly qualified as TxAssembly
+-----------------------------------
+-- tx-centrifuge:cardano-tracing --
+-----------------------------------
+import Cardano.Benchmarking.TxCentrifuge.Tracing.Dispatcher
+  qualified as TracingDispatcher
 
 --------------------------------------------------------------------------------
 -- Era
@@ -876,7 +881,7 @@ loadConfig = do
   validated <- either die pure $ Validated.validate raw funds
 
   -- Tracers.
-  tracers <- Tracing.setupTracers configFile
+  tracers <- TracingDispatcher.setupTracers configFile
 
   pure ( isDryRun, validated, codecConfig, networkId, networkMagic, tracers )
 

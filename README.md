@@ -667,7 +667,7 @@ tx-centrifuge/
 │   └── Main.hs                  # Executable entry point
 ├── lib/
 │   ├── pull-fiction/            # Domain-independent load generation library
-│   │   └── Cardano/Benchmarking/PullFiction/
+│   │   └── PullFiction/
 │   │       ├── Config/
 │   │       │   ├── Raw.hs           # JSON parsing (no validation)
 │   │       │   ├── Validated.hs     # Validation + cascading defaults
@@ -679,34 +679,37 @@ tx-centrifuge/
 │   │           ├── RateLimiter.hs   # GCRA token bucket
 │   │           └── Recycler.hs      # Closed-loop input recycling (worker, strategy-free)
 │   │
-│   └── tx-centrifuge/           # Cardano-specific library
-│       └── Cardano/Benchmarking/TxCentrifuge/
-│           ├── Block.hs             # Shared block types and tx extraction
-│           ├── Fund.hs              # UTxO/fund loading from JSON
-│           ├── NodeToClient.hs      # Multiplexed N2C connection (local socket)
-│           ├── NodeToClient/
-│           │   ├── TxIdSync.hs      # LocalChainSync tx confirmation (full blocks)
-│           │   ├── TxSubmission.hs  # LocalTxSubmission client
-│           │   └── UTxOQuery.hs     # LocalStateQuery UTxO discovery
-│           ├── NodeToNode.hs        # Multiplexed N2N connection (TCP)
-│           ├── NodeToNode/
-│           │   ├── KeepAlive.hs     # KeepAlive mini-protocol client
-│           │   ├── TxIdSync.hs      # ChainSync + BlockFetch tx confirmation
-│           │   └── TxSubmission.hs  # TxSubmission2 mini-protocol client
-│           ├── TxAssembly.hs        # Transaction building and signing
-│           ├── Tracing.hs           # Structured logging via trace-dispatcher
-│           └── Tracing/
-│               └── Orphans.hs       # LogFormatting/MetaTrace instances
+│   ├── cardano/                 # Cardano-specific library
+│   │   └── Cardano/Benchmarking/TxCentrifuge/
+│   │       ├── Block.hs             # Shared block types and tx extraction
+│   │       ├── Fund.hs              # UTxO/fund loading from JSON
+│   │       ├── NodeToClient.hs      # Multiplexed N2C connection (local socket)
+│   │       ├── NodeToClient/
+│   │       │   ├── TxIdSync.hs      # LocalChainSync tx confirmation (full blocks)
+│   │       │   ├── TxSubmission.hs  # LocalTxSubmission client
+│   │       │   └── UTxOQuery.hs     # LocalStateQuery UTxO discovery
+│   │       ├── NodeToNode.hs        # Multiplexed N2N connection (TCP)
+│   │       ├── NodeToNode/
+│   │       │   ├── KeepAlive.hs     # KeepAlive mini-protocol client
+│   │       │   ├── TxIdSync.hs      # ChainSync + BlockFetch tx confirmation
+│   │       │   └── TxSubmission.hs  # TxSubmission2 mini-protocol client
+│   │       ├── TxAssembly.hs        # Transaction building and signing
+│   │       └── Tracing.hs           # Trace events + contra-tracer bundle
+│   │
+│   └── cardano-tracing/         # trace-dispatcher rendering of those traces
+│       └── Cardano/Benchmarking/TxCentrifuge/Tracing/
+│           └── Dispatcher.hs        # LogFormatting/MetaTrace + tracer setup
 │
-├── test/                        # Test suites
-│   ├── lib/                     # Shared test harness (private library)
-│   │   └── Test/PullFiction/
-│   │       └── Harness.hs
-│   ├── pull-fiction/            # Pull-fiction unit tests
-│   └── tx-centrifuge/           # Tx-centrifuge unit tests
+├── test/                        # One test suite per library
+│   ├── cardano/                 # cardano unit tests
+│   ├── pull-fiction/            # pull-fiction unit tests
+│   └── pull-fiction-harness/    # Shared test harness (private library)
+│       └── Test/PullFiction/
+│           └── Harness.hs
 │
-└── bench/                       # Benchmarks
-    └── Bench.hs
+└── bench/
+    └── pull-fiction/            # pull-fiction benchmarks
+        └── Bench.hs
 ```
 
 ### Data Flow

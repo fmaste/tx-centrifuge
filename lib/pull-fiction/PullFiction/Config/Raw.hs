@@ -11,15 +11,15 @@
 -- collections are @'Map' 'String'@. No defaults are applied, no business rules
 -- are checked, and no cross-field relationships are enforced.
 -- All of that is the responsibility of
--- "Cardano.Benchmarking.PullFiction.Config.Validated".
+-- "PullFiction.Config.Validated".
 --
 -- All data constructors and fields are exported so that test code can build
 -- configuration values directly without going through JSON.
 --
 -- __Import qualified.__ Field names clash with
--- "Cardano.Benchmarking.PullFiction.Config.Validated" and
--- "Cardano.Benchmarking.PullFiction.Config.Runtime".
-module Cardano.Benchmarking.PullFiction.Config.Raw
+-- "PullFiction.Config.Validated" and
+-- "PullFiction.Config.Runtime".
+module PullFiction.Config.Raw
   (
     -- * Config.
     Config (..)
@@ -94,7 +94,7 @@ noUnknownFields name obj known =
 -- | Top-level configuration as parsed from JSON.
 --
 -- No invariants are enforced. Use 'validate' from
--- "Cardano.Benchmarking.PullFiction.Config.Validated" to apply business
+-- "PullFiction.Config.Validated" to apply business
 -- rules and cascading defaults.
 data Config = Config
   { -- | Which 'InputSource' loads the initial inputs, plus optional opaque

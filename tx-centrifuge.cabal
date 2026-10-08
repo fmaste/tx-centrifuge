@@ -114,8 +114,9 @@ executable tx-centrifuge
                     , stm
                     , text
                     , transformers
+                    , tx-centrifuge:cardano
+                    , tx-centrifuge:cardano-tracing
                     , tx-centrifuge:pull-fiction
-                    , tx-centrifuge:tx-centrifuge-lib
 
 --------------------------------------------------------------------------------
 
@@ -130,14 +131,14 @@ library pull-fiction
   import:             project-config, ghc-warnings
   hs-source-dirs:     lib/pull-fiction
   visibility:         public
-  exposed-modules:    Cardano.Benchmarking.PullFiction.Config.Raw
-                      Cardano.Benchmarking.PullFiction.Config.Runtime
-                      Cardano.Benchmarking.PullFiction.Config.Validated
-                      Cardano.Benchmarking.PullFiction.Clock
-                      Cardano.Benchmarking.PullFiction.WorkloadRunner
-  other-modules:      Cardano.Benchmarking.PullFiction.Internal.Pipe
-                      Cardano.Benchmarking.PullFiction.Internal.RateLimiter
-                      Cardano.Benchmarking.PullFiction.Internal.Recycler
+  exposed-modules:    PullFiction.Config.Raw
+                      PullFiction.Config.Runtime
+                      PullFiction.Config.Validated
+                      PullFiction.Clock
+                      PullFiction.WorkloadRunner
+  other-modules:      PullFiction.Internal.Pipe
+                      PullFiction.Internal.RateLimiter
+                      PullFiction.Internal.Recycler
   build-depends:      base >=4.12 && <5
                     , aeson
                     , async
@@ -148,10 +149,12 @@ library pull-fiction
                     , stm <2.5.2 || >=2.5.3
                     , text
 
--- Sub-library with node functionality decoupled from the core library above.
-library tx-centrifuge-lib
+-- Sub-library with the Cardano side: everything that knows about transactions,
+-- nodes and the node-to-node protocols. Decoupled from the engine above, which
+-- knows none of it.
+library cardano
   import:             project-config, ghc-warnings
-  hs-source-dirs:     lib/tx-centrifuge
+  hs-source-dirs:     lib/cardano
   visibility:         public
   exposed-modules:    Cardano.Benchmarking.TxCentrifuge.Block
                       Cardano.Benchmarking.TxCentrifuge.Fund
@@ -164,7 +167,6 @@ library tx-centrifuge-lib
                       Cardano.Benchmarking.TxCentrifuge.NodeToNode.TxIdSync
                       Cardano.Benchmarking.TxCentrifuge.NodeToNode.TxSubmission
                       Cardano.Benchmarking.TxCentrifuge.Tracing
-                      Cardano.Benchmarking.TxCentrifuge.Tracing.Orphans
                       Cardano.Benchmarking.TxCentrifuge.TxAssembly
   build-depends:      base >=4.12 && <5
                     , aeson
@@ -174,34 +176,63 @@ library tx-centrifuge-lib
                     , cardano-ledger-api
                     , cardano-ledger-core
                     , containers
-                    -- Version 0.2.0.0 is excluded because it cannot be used:
-                    -- its `Tracer` constructor no longer accepts a function and
-                    -- it has no `mkTracer` yet, so neither branch makes
-                    -- "Tracing.hs" compile. Excluding it here makes cabal pick
-                    -- a version that works instead of failing to compile.
-                    , contra-tracer <0.2 || >=0.2.1
+                    , contra-tracer
                     , io-classes:{io-classes, strict-stm}
                     , network
                     , network-mux
                     , ouroboros-consensus:{ouroboros-consensus, cardano, diffusion}
+                    -- Nothing here needs the sublibrary the
+                    -- `network-tracing-merged` flag chooses between, so neither
+                    -- branch is named and no upper bound is given, see that
+                    -- flag's comment above.
+                    , ouroboros-network:{ouroboros-network, api, framework, protocols} >=1.1
                     , random
                     , serialise
                     -- avoid stm-2.5.2 https://github.com/haskell/stm/issues/76
                     , stm <2.5.2 || >=2.5.3
                     , text
                     , time
+
+--------------------------------------------------------------------------------
+
+-- Sub-library with the trace-dispatcher side of the traces the library above
+-- declares: how each one is rendered, under which namespace and severity it is
+-- published, and the setup that creates the tracers. Apart so that "cardano"
+-- does not depend on trace-dispatcher, where the traces are plain data and the
+-- tracers plain contra-tracers. The instances for the "ouroboros-network"
+-- protocol messages live here too, every instance in one module.
+library cardano-tracing
+  import:             project-config, ghc-warnings
+  hs-source-dirs:     lib/cardano-tracing
+  visibility:         public
+  exposed-modules:    Cardano.Benchmarking.TxCentrifuge.Tracing.Dispatcher
+  build-depends:      base >=4.12 && <5
+                    , aeson
+                    , cardano-api
+                    , containers
+                    -- Version 0.2.0.0 is excluded because it cannot be used:
+                    -- its `Tracer` constructor no longer accepts a function and
+                    -- it has no `mkTracer` yet, so neither branch makes
+                    -- "Dispatcher.hs" compile. Excluding it here makes cabal
+                    -- pick a version that works instead of failing to compile.
+                    , contra-tracer <0.2 || >=0.2.1
+                    , ouroboros-network:{protocols} >=1.1
+                    , text
                     , trace-dispatcher
-                    , typed-protocols:{typed-protocols, stateful}
-  -- Which branch fits is decided by which sublibrary "ouroboros-network" has.
-  -- No upper bounds here on purpose, see the flag's comment above.
+                    , tx-centrifuge:cardano
+                    , typed-protocols:{typed-protocols}
+  -- "Ouroboros.Network.Tracing", imported by "Dispatcher.hs" for its instances,
+  -- is served by whichever of the two sublibraries this "ouroboros-network"
+  -- has. Which branch fits is decided by which sublibrary exists, not by a
+  -- version bound, see the flag's comment above.
   if flag(network-tracing-merged)
-    build-depends:    ouroboros-network:{ouroboros-network, api, framework, protocols, tracing} >=1.1
-    -- To make the `import` banners in "Tracing.hs" name the sublibrary this
+    build-depends:    ouroboros-network:{tracing} >=1.1
+    -- To make the `import` banners in "Dispatcher.hs" name the sublibrary this
     -- branch actually picked, instead of testing the version a second time and
     -- eventually disagreeing with it.
     cpp-options:      -DNETWORK_TRACING_MERGED
   else
-    build-depends:    ouroboros-network:{ouroboros-network, api, framework, protocols, framework-tracing} >=1.1
+    build-depends:    ouroboros-network:{framework-tracing} >=1.1
 
 --------------------------------------------------------------------------------
 
@@ -222,12 +253,12 @@ test-suite pull-fiction-test
                     , tasty
                     , tasty-hunit
                     , tx-centrifuge:pull-fiction
-                    , tx-centrifuge:test-harness
+                    , tx-centrifuge:pull-fiction-harness
 
-test-suite tx-centrifuge-test
+test-suite cardano-test
   import:             project-config, ghc-warnings, rts-defaults
   type:               exitcode-stdio-1.0
-  hs-source-dirs:     test/tx-centrifuge
+  hs-source-dirs:     test/cardano
   main-is:            Main.hs
   other-modules:      Test.TxCentrifuge.TxTest
   build-depends:      base >=4.12 && <5
@@ -236,12 +267,12 @@ test-suite tx-centrifuge-test
                     , clock
                     , tasty
                     , tasty-hunit
-                    , tx-centrifuge:tx-centrifuge-lib
+                    , tx-centrifuge:cardano
 
-library test-harness
+library pull-fiction-harness
   import:             project-config, ghc-warnings
   visibility:         private
-  hs-source-dirs:     test/lib
+  hs-source-dirs:     test/pull-fiction-harness
   exposed-modules:    Test.PullFiction.Harness
   build-depends:      base >=4.12 && <5
                     , aeson
@@ -254,10 +285,10 @@ library test-harness
 -- RTS configuration used by the executable and tests.
 --------------------------------------------------------------------------------
 
-benchmark core-bench
+benchmark pull-fiction-bench
   import:             project-config, ghc-warnings, rts-defaults
   type:               exitcode-stdio-1.0
-  hs-source-dirs:     bench
+  hs-source-dirs:     bench/pull-fiction
   main-is:            Bench.hs
   other-modules:      Paths_tx_centrifuge
   autogen-modules:    Paths_tx_centrifuge
@@ -266,5 +297,5 @@ benchmark core-bench
                     , criterion
                     , deepseq
                     , tx-centrifuge:pull-fiction
-                    , tx-centrifuge:test-harness
+                    , tx-centrifuge:pull-fiction-harness
 

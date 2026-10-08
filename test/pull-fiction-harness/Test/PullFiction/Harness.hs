@@ -64,9 +64,9 @@ import Data.Map.Strict qualified as Map
 ---------------------
 -- pull-fiction --
 ---------------------
-import Cardano.Benchmarking.PullFiction.Config.Runtime qualified as Runtime
-import Cardano.Benchmarking.PullFiction.Config.Validated qualified as Validated
-import Cardano.Benchmarking.PullFiction.WorkloadRunner (runWorkload)
+import PullFiction.Config.Runtime qualified as Runtime
+import PullFiction.Config.Validated qualified as Validated
+import PullFiction.WorkloadRunner (runWorkload)
 
 --------------------------------------------------------------------------------
 

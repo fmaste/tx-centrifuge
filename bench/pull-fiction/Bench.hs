@@ -24,7 +24,7 @@ import Test.PullFiction.Harness qualified as Harness
 --------------------------------------------------------------------------------
 
 -- | Local wrapper so Criterion can force benchmark results without requiring an
--- NFData instance in the test-harness library.
+-- NFData instance in the pull-fiction-harness library.
 newtype BenchResult = BenchResult Harness.TestResult
 
 instance NFData BenchResult where

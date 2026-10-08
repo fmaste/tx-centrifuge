@@ -54,7 +54,7 @@
 -- reset and an unknown-key event is /ignored/.) This is what lets the generator
 -- share a chain with unrelated traffic without recycling, or resetting on,
 -- other people's events.
-module Cardano.Benchmarking.PullFiction.Internal.Recycler
+module PullFiction.Internal.Recycler
   ( -- * Recycler.
     Recycler, mkRecycler
   , runRecycler
@@ -92,7 +92,7 @@ import Control.Concurrent.STM qualified as STM
 ------------------
 -- pull-fiction --
 ------------------
-import Cardano.Benchmarking.PullFiction.Internal.Pipe qualified as Pipe
+import PullFiction.Internal.Pipe qualified as Pipe
 
 --------------------------------------------------------------------------------
 

@@ -13,7 +13,7 @@
 -- The 'TBQueue' is an explicit parameter so that queue reads and rate-limit
 -- accounting are atomic while the limiter stays decoupled from any particular
 -- queue.
-module Cardano.Benchmarking.PullFiction.Internal.RateLimiter
+module PullFiction.Internal.RateLimiter
   ( RateLimiter, newTokenBucket, newUnlimited
   , waitToken, tryWaitToken
   ) where
@@ -27,7 +27,7 @@ import Control.Concurrent.STM qualified as STM
 ------------------
 -- pull-fiction --
 ------------------
-import Cardano.Benchmarking.PullFiction.Clock qualified as Clock
+import PullFiction.Clock qualified as Clock
 
 --------------------------------------------------------------------------------
 

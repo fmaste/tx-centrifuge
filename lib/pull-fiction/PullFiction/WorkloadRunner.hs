@@ -2,7 +2,7 @@
 
 --------------------------------------------------------------------------------
 
-module Cardano.Benchmarking.PullFiction.WorkloadRunner
+module PullFiction.WorkloadRunner
   ( TargetWorker
   , runWorkload
   ) where
@@ -25,8 +25,8 @@ import Data.Map.Strict qualified as Map
 ------------------
 -- pull-fiction --
 ------------------
-import Cardano.Benchmarking.PullFiction.Config.Runtime qualified as Runtime
-import Cardano.Benchmarking.PullFiction.Internal.Pipe qualified as Pipe
+import PullFiction.Config.Runtime qualified as Runtime
+import PullFiction.Internal.Pipe qualified as Pipe
 
 --------------------------------------------------------------------------------
 -- Workload runner.

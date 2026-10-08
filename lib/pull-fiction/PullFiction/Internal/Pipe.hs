@@ -14,7 +14,7 @@
 -- Work flows input queue → builder → payload queue → worker. The 'Pipe' knows
 -- /nothing/ about recycling: the bookkeeping and the recycle loop that closes
 -- inputs back onto the input queue live in
--- 'Cardano.Benchmarking.PullFiction.Internal.Recycler' (the strategy wiring
+-- 'PullFiction.Internal.Recycler' (the strategy wiring
 -- lives in 'Config.Runtime'), which drives this pipe from the outside (it
 -- calls 'addInputs' to recycle). 'Config.Runtime' wraps 'payloadFetcher' and
 -- fires the workload's dequeue wiring on each pull.
@@ -35,7 +35,7 @@
 -- the observer announce loop and per-target fetch workers in @Main@).
 --
 -- The data constructor is hidden, build a 'Pipe' with 'mkPipe'.
-module Cardano.Benchmarking.PullFiction.Internal.Pipe
+module PullFiction.Internal.Pipe
   ( -- * Pipe (content is kept private).
     Pipe, mkPipe
     -- * Event handlers.
@@ -67,9 +67,9 @@ import Control.Concurrent.STM qualified as STM
 ------------------
 -- pull-fiction --
 ------------------
-import Cardano.Benchmarking.PullFiction.Clock qualified as Clock
-import Cardano.Benchmarking.PullFiction.Config.Raw qualified as Raw
-import Cardano.Benchmarking.PullFiction.Internal.RateLimiter qualified as RL
+import PullFiction.Clock qualified as Clock
+import PullFiction.Config.Raw qualified as Raw
+import PullFiction.Internal.RateLimiter qualified as RL
 
 --------------------------------------------------------------------------------
 

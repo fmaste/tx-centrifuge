@@ -5,7 +5,7 @@
 
 -- | Validated load-generator configuration with cascading defaults applied.
 --
--- Types mirror "Cardano.Benchmarking.PullFiction.Config.Raw" but with hidden
+-- Types mirror "PullFiction.Config.Raw" but with hidden
 -- data constructors. The only way to obtain values is through 'validate', which
 -- guarantees that every value has passed validation (e.g. @tps > 0@,
 -- valid names, etc).
@@ -29,9 +29,9 @@
 -- (alphabetical order, JSON object key order is not preserved).
 --
 -- __Import qualified.__ Field names clash with
--- "Cardano.Benchmarking.PullFiction.Config.Raw" and
--- "Cardano.Benchmarking.PullFiction.Config.Runtime".
-module Cardano.Benchmarking.PullFiction.Config.Validated
+-- "PullFiction.Config.Raw" and
+-- "PullFiction.Config.Runtime".
+module PullFiction.Config.Validated
   (
     -- * Config.
     Config
@@ -77,7 +77,7 @@ import Data.Map.Strict qualified as Map
 ------------------
 -- pull-fiction --
 ------------------
-import Cardano.Benchmarking.PullFiction.Config.Raw qualified as Raw
+import PullFiction.Config.Raw qualified as Raw
 
 --------------------------------------------------------------------------------
 -- Defaults.
