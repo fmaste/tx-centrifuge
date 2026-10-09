@@ -1,4 +1,5 @@
 {-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE RankNTypes #-}
 
 --------------------------------------------------------------------------------
 
@@ -9,6 +10,8 @@ module PullFiction.Config.Runtime
   ( -- * Runtime.
     Runtime
   , config, builders, pipes, recyclers, observers, forwarders, workloads, asyncs
+    -- * Initial inputs.
+  , InputFold
     -- * Handles.
     -- ** Behaviour handles (what the resource does).
   , BuilderApi     (..)
@@ -51,8 +54,8 @@ module PullFiction.Config.Runtime
 -- base --
 ----------
 import Control.Concurrent (myThreadId)
-import Control.Monad (forever)
-import Data.Foldable (foldlM, toList)
+import Control.Monad (forever, when)
+import Data.Foldable (foldlM)
 import GHC.Conc (labelThread)
 import Numeric.Natural (Natural)
 -----------
@@ -94,7 +97,7 @@ import PullFiction.Internal.Recycler qualified as Recycler
 -- ('Pipe.Pipe') carrying neither a name field nor an async.
 data Runtime key input payload = Runtime
   { -- | The original validated configuration.
-    config     :: !(Validated.Config input)
+    config     :: !Validated.Config
     -- | Resolved builders (build loops), keyed by name.
   , builders   :: !(Map String Builder)
     -- | Resolved pipes (queue pairs), keyed by name. Pure structure: the only
@@ -118,6 +121,23 @@ data Runtime key input payload = Runtime
     -- Caller should append their own worker asyncs for cleanup.
   , asyncs     :: ![Async.Async ()]
   }
+
+--------------------------------------------------------------------------------
+
+-- | Where the initial inputs come from: a fold over them, which 'resolve' runs
+-- once over the queues it has just created. It is a caller-supplied action
+-- like the factories 'resolve' takes, which is why it lives here and not in
+-- 'Validated.Config', where everything is static data.
+--
+-- A fold rather than a list so that nothing holds every input at once: a file
+-- of millions of them costs what the queues cost and no more.
+--
+-- The @forall@ is inside, so the accumulator is the consumer\'s to pick and
+-- the supplier cannot pin it (rank 2, hence @RankNTypes@). 'resolvePipes'
+-- counts positions with it; something else here could fold over the queues
+-- themselves.
+type InputFold input =
+  forall acc. (acc -> input -> IO acc) -> acc -> IO acc
 
 --------------------------------------------------------------------------------
 
@@ -326,8 +346,8 @@ type LimiterCache = Map String RL.RateLimiter
 --
 -- Initial inputs all go into one input queue, which every workload draws from.
 -- Under @\"scope\": \"per_workload\"@ there is a queue per workload instead and
--- they are split equally across them, the last queue taking the remainder (see
--- 'Raw.InputsScope').
+-- they are dealt round-robin over them, so they spread evenly without anyone
+-- having to know how many there will be (see 'Raw.InputsScope').
 resolve
   :: Ord key
   -- | Builder factory (index, name, config).
@@ -344,11 +364,14 @@ resolve
   -> (Int -> String -> String -> IO (RecyclerHandle key input payload))
   -- | Observer factory (index, name, config).
   -> (Int -> String -> Raw.Observer -> IO (ObserverHandle key))
-  -> Validated.Config input
+  -- | Folds over the initial inputs, run once the input queues exist.
+  -> InputFold input
+  -> Validated.Config
   -> IO (Runtime key input payload)
-resolve mkBuilderFn mkPipeHandleFn mkRecyclerHandleFn mkObserverFn validatedConfig = do
-  let workloadsMap  = Validated.workloads validatedConfig
-      initialInputs = toList (Validated.initialInputs validatedConfig)
+resolve
+    mkBuilderFn mkPipeHandleFn mkRecyclerHandleFn mkObserverFn
+    foldInitialInputs validatedConfig = do
+  let workloadsMap = Validated.workloads validatedConfig
   -- The name of the one input queue the workloads share. It cannot collide with
   -- a workload name because a workload name may not start with @\@@ (checked at
   -- validation time), the scheme 'Validated.rateLimitKey' already uses.
@@ -359,23 +382,16 @@ resolve mkBuilderFn mkPipeHandleFn mkRecyclerHandleFn mkObserverFn validatedConf
   -- all of their recyclers enqueue back into it. The name is also what the
   -- pipe's input-queue events are reported under (it is passed to the
   -- pipe-events factory).
-  let (inputQueueNameByWorkload, inputsByInputQueue) =
+  let inputQueueNameByWorkload =
         case Validated.initialInputsScope validatedConfig of
           -- One queue for every workload, holding the whole load. A workload
           -- that keeps more inputs in flight simply takes more of it.
           Raw.InputsShared ->
-            ( Map.map (const sharedInputQueueName) workloadsMap
-            , Map.singleton sharedInputQueueName initialInputs
-            )
-          -- One queue per workload, named after it, holding an equal share of
-          -- the load (the last queue takes the remainder). Nothing is shared:
-          -- a workload only ever sees the inputs of its own queue.
+            Map.map (const sharedInputQueueName) workloadsMap
+          -- One queue per workload, named after it. Nothing is shared: a
+          -- workload only ever sees the inputs of its own queue.
           Raw.InputsPerWorkload ->
-            ( Map.mapWithKey (\wlName _ -> wlName) workloadsMap
-            , Map.fromAscList
-                (zip (Map.keys workloadsMap)
-                     (partitionInputs (Map.size workloadsMap) initialInputs))
-            )
+            Map.mapWithKey (\wlName _ -> wlName) workloadsMap
   -- Resolve the name-keyed pools in dependency order: each resolver takes the
   -- already-resolved pools its entries reference. Observers stand alone, a
   -- recycler needs its pipe, a builder and a workload's targets need their pipe
@@ -383,7 +399,8 @@ resolve mkBuilderFn mkPipeHandleFn mkRecyclerHandleFn mkObserverFn validatedConf
   resolvedObservers  <- resolveObservers  mkObserverFn
                           (Validated.observers validatedConfig)
   resolvedPipes      <- resolvePipes      mkPipeHandleFn
-                          inputQueueNameByWorkload inputsByInputQueue
+                          inputQueueNameByWorkload
+                          foldInitialInputs
                           (Validated.payloadQueueCapacity validatedConfig)
                           workloadsMap
   resolvedRecyclers  <- resolveRecyclers  mkRecyclerHandleFn
@@ -506,25 +523,30 @@ resolvePipes
   -- handlers the pipe fires at each queue event.
   :: (Int -> String -> String -> IO (PipeHandle key input))
   -- | Name of the input queue each workload's pipe is built over, keyed by
-  -- workload name. Two workloads under one name share that queue.
+  -- workload name. Two workloads under one name share that queue. The distinct
+  -- names here are the queues to create.
   -> Map String String
-  -- | Each input queue's initial inputs, keyed by input queue name.
-  -> Map String [input]
+  -- | Folds over the initial inputs, run once the queues exist.
+  -> InputFold input
   -- | Capacity of each payload queue (from 'Validated.payloadQueueCapacity').
   -> Natural
   -> Map String Validated.Workload
   -> IO (Map String (Pipe.Pipe key input payload))
 resolvePipes
-    mkPipeHandleFn inputQueueNameByWorkload inputsByInputQueue
+    mkPipeHandleFn inputQueueNameByWorkload foldInitialInputs
     payloadQueueCapacity workloadsMap = do
-  -- The input queues, keyed by name: an empty queue and its depth counter each.
+  -- The input queues, keyed by name: an empty queue and its depth counter
+  -- each, one per distinct name however many workloads share it.
   inputQueues <- mapM
-    (\_initialInputs -> do
+    (\() -> do
       inputQueue <- STM.newTQueueIO
       inputDepth <- STM.newTVarIO (0 :: Natural)
       pure (inputQueue, inputDepth)
     )
-    inputsByInputQueue
+    (Map.fromList
+      [ (inputQueueName, ())
+      | inputQueueName <- Map.elems inputQueueNameByWorkload
+      ])
   -- One pipe per workload, each tagged with the name of the input queue it was
   -- built over. Both maps below are projections of this one pass, so no second
   -- lookup can disagree with it about which queue a pipe belongs to.
@@ -562,18 +584,30 @@ resolvePipes
         [ (inputQueueName, thePipe)
         | (_, inputQueueName, thePipe) <- builtPipes
         ]
-  -- Load the initial inputs one at a time through 'Pipe.addInputs', the same
-  -- call the recycler uses so each enters exactly like a recycled one. The
-  -- lookup is total: the scope branch that keyed 'inputsByInputQueue' is the
-  -- one that named every queue in 'loaderPipes'.
-  mapM_
-    (\(inputQueueName, initialInputs) -> do
-      let loaderPipe = loaderPipes Map.! inputQueueName
-      mapM_
-        (\initialInput -> Pipe.addInputs loaderPipe [initialInput])
-        initialInputs
+  -- Fold the initial inputs into the queues, one at a time through
+  -- 'Pipe.addInputs', the same call the recycler uses so each enters exactly
+  -- like a recycled one. Nothing is held in between: an input is queued as it
+  -- arrives, so millions of them cost the queues and no more.
+  --
+  -- One rule covers both scopes: the queues in name order, round-robin by the
+  -- input's position. Under "shared" there is one queue and every input lands
+  -- on it; under "per_workload" they spread evenly over the workloads without
+  -- anyone having to know how many inputs there will be.
+  let loaderPipeList  = Map.elems loaderPipes
+      inputQueueCount = length loaderPipeList
+  -- The accumulator is the input's position, which is also the count.
+  fedCount <- foldInitialInputs
+    (\ix input -> do
+      Pipe.addInputs (loaderPipeList !! (ix `mod` inputQueueCount)) [input]
+      pure $! ix + 1
     )
-    (Map.toAscList inputsByInputQueue)
+    (0 :: Int)
+  -- The inputs have to cover every queue: with fewer, a queue starts empty and
+  -- the workload on it waits for inputs that no build can produce. The rule
+  -- lives here because the count exists only once the inputs are in.
+  when (fedCount < inputQueueCount) $
+    fail $ "Runtime: not enough initial inputs (" ++ show fedCount
+        ++ ") for " ++ show inputQueueCount ++ " input queue(s)"
   pure resolvedPipes
 
 -- | Resolve one recycler per workload into a name-keyed pool. For each, build
@@ -936,21 +970,4 @@ getOrCreateLimiter cache target =
         Nothing       -> do
           limiter <- RL.newTokenBucket tpsValue
           pure (limiter, Map.insert key limiter cache)
-
---------------------------------------------------------------------------------
--- Input partitioning.
---------------------------------------------------------------------------------
-
--- | Split a list into @n@ contiguous chunks of roughly equal size.
--- The last chunk absorbs any remainder.
-partitionInputs :: Int -> [a] -> [[a]]
-partitionInputs n xs
-  | n <= 1    = [xs]
-  | otherwise = go xs n
-  where
-    chunkSize = length xs `div` n
-    go remaining 1 = [remaining]
-    go remaining k =
-      let (chunk, rest) = splitAt chunkSize remaining
-      in  chunk : go rest (k - 1)
 

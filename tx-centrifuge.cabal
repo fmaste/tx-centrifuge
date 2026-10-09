@@ -170,6 +170,7 @@ library cardano
                       Cardano.Benchmarking.TxCentrifuge.TxAssembly
   build-depends:      base >=4.12 && <5
                     , aeson
+                    , base16-bytestring
                     , bytestring
                     , cardano-api
                     , cardano-diffusion

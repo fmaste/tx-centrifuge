@@ -50,7 +50,7 @@ pipelineTests dur = Tasty.testGroup "pipeline"
   --
   -- Inputs are tagged with (workloadIndex, inputIndex) tuples. If any worker
   -- ever observes an input with a foreign workload tag, the test fails
-  -- immediately. This also exercises resolve's partition logic.
+  -- immediately. This also exercises resolve's input distribution.
 
   , HUnit.testCase
       "Multi-group pipeline isolation (50 groups x 1 TPS, 10s)" $ do
@@ -66,8 +66,8 @@ pipelineTests dur = Tasty.testGroup "pipeline"
   --
   -- Inputs carry the same (workloadIndex, inputIndex) tags, so here a workload
   -- is expected to work on another workload's inputs: the test fails if no
-  -- workload ever observes a foreign tag, the exact result the per-queue
-  -- partition of test 2 gives.
+  -- workload ever observes a foreign tag, the exact result the per-workload
+  -- queues of test 2 give.
 
   , HUnit.testCase
       "Shared input queue (3 groups x 1 TPS, 10s)" $ do

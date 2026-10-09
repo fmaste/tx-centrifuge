@@ -65,7 +65,7 @@ txTests = Tasty.testGroup "node"
           -- One output fund recycled.
           length outFunds @?= 1
           -- Output value = input - fee.
-          Fund.fundValue (head outFunds) @?= (10_000_000 - 200_000)
+          Fund.fundLovelace (head outFunds) @?= (10_000_000 - 200_000)
           -- The recycled fund's TxIn references the new tx.
           let txId = Api.getTxId (Api.getTxBody tx)
           Fund.fundTxIn (head outFunds)
@@ -84,7 +84,7 @@ txTests = Tasty.testGroup "node"
           -- Three output funds.
           length outFunds @?= 3
           -- Total output = total input - fee.
-          let totalOut = sum (map Fund.fundValue outFunds)
+          let totalOut = sum (map Fund.fundLovelace outFunds)
           totalOut @?= (10_000_000 - 200_000)
 
   , HUnit.testCase "buildTx: insufficient funds" $ do
@@ -202,6 +202,6 @@ mkDummyFund signKey index lovelace = Fund.Fund
             (Api.Testnet (Api.NetworkMagic 42))
             signKey
       in Api.TxIn txId (Api.TxIx index)
-  , Fund.fundValue = lovelace
+  , Fund.fundLovelace = lovelace
   , Fund.fundSignKey = signKey
   }

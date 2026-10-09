@@ -322,7 +322,7 @@ renderFund :: Logging.DetailLevel -> Fund.Fund -> Value
 renderFund dtal fund
   | dtal >= Logging.DMaximum =
       object [ "utxo"     .= Api.renderTxIn (Fund.fundTxIn fund)
-             , "lovelace" .= Fund.fundValue fund
+             , "lovelace" .= Fund.fundLovelace fund
              ]
   | otherwise =
       String (Api.renderTxIn (Fund.fundTxIn fund))

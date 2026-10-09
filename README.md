@@ -15,7 +15,7 @@ A basic configuration defines how to load initial resources, how to build payloa
     "genesis-funds": {
       "type": "genesis_utxo_keys",
       "params": {
-        "signing_keys_file": "funds.json"
+        "signing_keys_file": "funds.jsonl"
       }
     }
   },
@@ -100,11 +100,13 @@ The underlying `pull-fiction` library implements a reactive rate-limiting strate
 6. **Outputs are recycled** back to the Input Queue according to the configured `recycle` strategy, enabling indefinite-duration runs
 
 ### Reactive Rate Limiting
+
 - **Downstream Driven**: Load is only dispensed in response to an explicit pull from a target. If the target doesn't ask, the engine stays idle.
 - **Ceiling Enforcement**: The rate limiter enforces a tokens-per-second (TPS) ceiling. Even if a consumer pulls aggressively, the engine ensures the dispensed items never exceed the configured limit.
 - **Fairness**: Token slots are claimed in a single atomic STM transaction, providing FIFO-fair scheduling across multiple workers sharing the same limiter.
 
 ### Workloads and Targets
+
 The configuration is organized into a hierarchy that defines the concurrency model:
 
 - **Target**: A single network endpoint (e.g., a Cardano node). Each target has a dedicated **Worker thread** that manages the network connection and handles requests.
@@ -114,6 +116,7 @@ The configuration is organized into a hierarchy that defines the concurrency mod
   - **Isolation**: By using multiple workloads, you can isolate different groups of targets. For example, one workload could simulate high-volume "small" transactions for one group of nodes, while another generates "heavy" transactions for another.
 
 ### Pipeline Architecture
+
 The engine operates as a decoupled production pipeline using generic `input` and `payload` types:
 1.  **Initial Inputs**: Starting resources are bulk-loaded into the Input Queue at startup, one queue shared by every workload unless the config asks for one per workload (see [Input scope](#input-scope-scope)).
 2.  **Input Queue (Unbounded)**: Holds available inputs. Every builder on it takes from it and every recycler returns to it.
@@ -122,6 +125,7 @@ The engine operates as a decoupled production pipeline using generic `input` and
 5.  **Workers (One per Target)**: Threads that manage the consumer connection. They pull from the payload queue via a rate-limited fetcher.
 
 ### Resource Recycling
+
 To enable indefinite-duration runs with finite resources, inputs must be returned to the `Input Queue` (the shared one, or the workload's own under `"scope": "per_workload"`). The `recycle` field on the `builder` selects when this happens. There are three strategies:
 
 1.  **`on_build`** — Resources return to the `Input Queue` as soon as the payload is constructed: the build itself counts as the confirmation, so the recycler releases the outputs right away (an `AddToBacklog` and an `AddToPipe` trace per payload). This is the highest-throughput mode but assumes the payload will be successfully processed downstream.
@@ -139,6 +143,7 @@ To enable indefinite-duration runs with finite resources, inputs must be returne
     ```json
     "recycle": { "type": "on_confirm", "params": "my-observer" }
     ```
+
 #### Rollback recovery (`recovery`)
 
 Any builder with a `recycle` strategy may additionally carry a **`recovery`**, a sibling of `recycle` in the builder object, naming the observer whose orphan events trigger it and the input source that rebuilds the queued inputs:
@@ -168,38 +173,97 @@ This is what makes the optimistic strategies (`on_build`, `on_pull`) safe to run
 ## Configuration
 
 ### Node Configuration (`nodeConfig`)
+
 The top-level `nodeConfig` field is the path to the Cardano node's configuration file (e.g., `node-config.json`). The generator reads the consensus protocol from it and derives the network it runs against (mainnet or a testnet magic) from that protocol. This is the single source of the network: it is used to build addresses, submit transactions, and query the node for UTxOs, so no network magic is configured anywhere else.
 
 ### Input Sources (`input_sources`)
+
 The top-level `input_sources` pool defines named ways to obtain UTxO funds, as `type` + `params` entries like observers. Sources are referenced by name from [`initial_inputs`](#initial-inputs-initial_inputs) (the startup load) and from builder [`recovery`](#rollback-recovery-recovery) entries (rebuilding a builder's queued inputs after a rollback). Validation enforces that every referenced source is defined and that every defined source is referenced. Observer and input source names live in independent namespaces (every reference field is typed: `source` resolves against `input_sources`, `observer` against `observers`), so an observer and a source may share a name.
 
 The `type` field selects the source. Two variants are available:
 
-**`genesis_utxo_keys`** — load funds from a JSON file. `params`:
-- **`signing_keys_file`**: Path to a JSON file (e.g., `funds.json`) containing the actual fund data.
+**`genesis_utxo_keys`** — load funds from a fund file. `params`:
+- **`signing_keys_file`**: Path to the fund file (e.g. `funds.jsonl`) containing the actual fund data. Two shapes are accepted, a JSON array or JSONL, see below.
 
-#### `funds.json` entry types
-The file contains an array of fund objects. Each object has two required fields (`signing_key`, `value`) and one optional field (`tx_in`):
+#### Fund file entry types
 
-| Field         | Required | Description |
-|---------------|----------|-------------|
-| `signing_key` | Yes      | Path to a `.skey` file (payment or genesis UTxO key) |
-| `value`       | Yes      | Lovelace amount |
-| `tx_in`       | No       | Explicit UTxO reference in `"txid#ix"` format |
+The file holds fund objects, as a JSON array or one per line (see
+[below](#one-object-per-line-for-very-large-files)). Each object carries its key
+in one of two fields, plus a required `lovelace` and an optional `tx_in`:
+
+| Field             | Required       | Description |
+|-------------------|----------------|-------------|
+| `signing_key`     | one of the two | Path of a `.skey` file |
+| `skey_cbor_hex`   | one of the two | The key itself: the `cborHex` of such a file |
+| `lovelace`        | Yes            | Lovelace amount, one number, not a multi-asset `Value` |
+| `tx_in`           | No             | Explicit UTxO reference in `"txid#ix"` format |
+
+#### `signing_key` or `skey_cbor_hex`
+
+A path, read at startup:
+```json
+{ "signing_key": "utxo1.skey", "lovelace": 9000000000 }
+```
+
+Or the key itself, which keeps the fund file self-contained with no keys to ship
+beside it and no file to open per entry:
+```json
+{ "skey_cbor_hex": "5820a1b2...", "lovelace": 9000000000 }
+```
+
+Exactly one of the two. Both missing is an error, both present is an error, and
+neither is guessed from the text: the field name says which one an entry
+carries.
+
+`skey_cbor_hex` is the 68 hex characters of a `.skey` file's `cborHex` field, the
+CBOR of the 32-byte ed25519 key, so it starts with `5820`. The file's `type` is
+not needed: both accepted key types, `PaymentSigningKeyShelley_ed25519` and
+`GenesisUTxOSigningKey_ed25519`, hold the same key and serialise it the same,
+and the genesis one is cast to a payment key, so the same hex decodes to the
+same key either way. Anything else, an extended `..._ed25519_bip32` key for
+one, fails to decode and says so.
+
+Mixing both forms in one file is fine. A path is read once per entry that names
+it, so a file of a million such entries opens a million files, while an inline
+key needs none: that is the shape to use at that size.
+
+Fields an entry does not use are ignored, so a file that carries more per entry,
+an address for instance, loads as it is with no pass to strip them.
 
 When `tx_in` is **present**, the fund uses the explicit UTxO reference:
 ```json
-{ "signing_key": "payment.skey", "value": 1000000, "tx_in": "df6...#0" }
+{ "signing_key": "payment.skey", "lovelace": 1000000, "tx_in": "df6...#0" }
 ```
 
 When `tx_in` is **omitted**, the fund is treated as a genesis UTxO: the `TxId` is derived deterministically from the signing key's verification key hash via `genesisUTxOPseudoTxIn`, and the `TxIx` is always 0.
 ```json
-{ "signing_key": "genesis.skey", "value": 1500000000000 }
+{ "signing_key": "genesis.skey", "lovelace": 1500000000000 }
 ```
 
-**Design Note**: The `funds.json` format is designed to be compatible with the output of `cardano-cli conway create-testnet-data --utxo-keys`. This allows you to immediately use an arbitrary large set of Shelley genesis keys created during testnet bootstrapping as the initial fund pool for the generator, without needing to manually create UTxOs once the network is live.
+#### One object per line, for very large files
+
+The loader accepts two shapes and tells them apart by the first character that
+is not whitespace:
+
+| First character | Shape | How it is read |
+|-----------------|-------|----------------|
+| `[` | a JSON array of fund objects | decoded whole |
+| anything else | **one fund object per line** | streamed, a line at a time |
+
+```
+{"skey_cbor_hex":"5820a1b2...","lovelace":9000000000}
+{"skey_cbor_hex":"5820c3d4...","lovelace":9000000000}
+```
+
+Both shapes produce the same funds; only the memory profile differs. An array
+needs the file, a JSON tree of it and the funds in memory at once, which is
+fine for the thousands of entries a testnet hands out. One object per line
+keeps memory at the funds plus the single line in hand, whatever the number of
+entries, which is what millions need. Every line has to be one fund object, a
+blank one included, so line N is fund N, and an error names the line it is on.
 
 #### `utxo_query`
+
 Discover funds **on chain** instead of from a file. The generator queries a node (over its NodeToClient socket) for the UTxOs currently at one or more addresses. The addresses come from the use site: `initial_inputs` supplies signing keys in its `params`, a builder `recovery` queries the builder's own destination address.
 
 `params`:
@@ -208,6 +272,7 @@ Discover funds **on chain** instead of from a file. The generator queries a node
 The query era is detected from the node at runtime, so it follows the chain across the Shelley-based eras cardano-api supports (Shelley through Conway today).
 
 ### Initial Inputs (`initial_inputs`)
+
 The generator requires a set of initial UTxOs, loaded through a named input source at startup. `initial_inputs` always has a **`source`** (the name of the `input_sources` entry to load from); whether it also has a **`params`** depends on that source's type. There are exactly two combinations:
 
 **With a `genesis_utxo_keys` source** — the source is self-contained (its file holds everything), so `initial_inputs` is just the reference. Adding `params` here is a startup error:
@@ -217,7 +282,7 @@ The generator requires a set of initial UTxOs, loaded through a named input sour
 "input_sources": {
   "genesis-funds": {
     "type": "genesis_utxo_keys",
-    "params": { "signing_keys_file": "funds.json" }
+    "params": { "signing_keys_file": "funds.jsonl" }
   }
 }
 ```
@@ -242,12 +307,13 @@ The generator requires a set of initial UTxOs, loaded through a named input sour
 Loading through a `utxo_query` source makes restarts **stateless**: each builder recycles its outputs back to its `destination_signing_key` address, so pointing the `signing_keys` at those same keys re-discovers whatever a previous run left on chain. If no UTxOs are found at any queried address, the generator exits with an error rather than starting. Fund the address of at least one configured `signing_keys` entry and restart.
 
 #### Input scope (`scope`)
+
 `initial_inputs` takes an optional **`scope`** that says how many input queues the loaded inputs are split into:
 
 | `scope` | Input queues | Who draws from each |
 |---------|--------------|---------------------|
 | `shared` (default) | One for all the workloads, holding every input | All of them: every workload takes from that queue and every recycler enqueues back into it |
-| `per_workload` | One per workload, each holding an equal share of the inputs | Only its own workload: it takes from that queue and recycles back into it |
+| `per_workload` | One per workload, the inputs dealt round-robin over them | Only its own workload: it takes from that queue and recycles back into it |
 
 Inputs are fungible, since a fund carries the signing key needed to spend it, so any workload can use any fund. That is why `shared` is the default: a split has to be sized for the workload that keeps the most inputs in flight, which is its rate times the confirmation latency of the cluster under test, and a config file cannot know that figure. Get it wrong and one workload starves while the inputs it needs sit in queues it cannot reach.
 
@@ -266,6 +332,7 @@ What `shared` means in practice:
 ```
 
 ### Rate Limiting (`rate_limit`)
+
 The `rate_limit` field can be set at the **top level** or at the **workload level** (but not both — setting it at both levels is a validation error). If omitted entirely, targets run **unlimited** (no rate ceiling).
 
 The `scope` determines the granularity of the TPS ceiling. Available scopes depend on where the rate limit is defined:
@@ -291,6 +358,7 @@ Most configuration fields can be set at multiple levels. The most specific value
 Workload, target, observer, and input source names must be non-empty, must not start with `@`, and must not contain `.` or `/` (`@` and `.` are reserved for internal rate-limiter cache keys and for the shared input queue's name `@shared`, `/` for the forwarder pool's wiring-path keys).
 
 ### Batching and Flow Control
+
 - **`max_batch_size`**: Limits the number of items (e.g., transactions) the generator will announce to a target in a single protocol request. **0 means unlimited** (use whatever the node requests). Defaults to 0.
   - This acts as a safety cap: even if a target's protocol allows for 500 items, a `max_batch_size` of 100 ensures the generator doesn't commit too much capacity to a single connection at once.
   - This helps distribute the available "payload queue" more evenly across multiple targets and prevents a single aggressive node from starving others.
@@ -299,6 +367,7 @@ Workload, target, observer, and input source names must be non-empty, must not s
   - `error`: The generator fails immediately if the builder cannot keep up with the requested TPS.
 
 ### Startup Delay (`startup_delay_seconds`)
+
 An optional **top-level** field that delays the start of transmission. Waits this many seconds before the workers open their connections to the targets but after the builders are spawned and filling the payload queues.
 
 - **Value**: a non-negative integer number of **seconds**.
@@ -387,10 +456,11 @@ namespaces.
 ## Cardano Implementation (`tx-centrifuge`)
 
 ### Value Builder Parameters
+
 These parameters define the **transaction profile** for a workload:
 - `inputs_per_tx` / `outputs_per_tx`: Controls the transaction structure (size and complexity).
 - `fee`: Fixed Lovelace fee per transaction.
-- `destination_signing_key` (optional): Path to a `.skey` file (a payment or genesis UTxO key, like the `signing_key` entries in funds.json) whose address receives every output this builder produces and which spends the recycled UTxOs. When omitted, a built-in per-builder key is derived instead. Supplying your own key lets you fund and inspect a known address, which is printed to stderr at startup. Note that with a single destination every recycled input shares one key, so steady-state transactions carry **one witness** regardless of `inputs_per_tx` (smaller than the initial batch built from distinct genesis keys).
+- `destination_signing_key` (optional): Path to a `.skey` file (a payment or genesis UTxO key, like the `signing_key` entries in the fund file) whose address receives every output this builder produces and which spends the recycled UTxOs. When omitted, a built-in per-builder key is derived instead. Supplying your own key lets you fund and inspect a known address, which is printed to stderr at startup. Note that with a single destination every recycled input shares one key, so steady-state transactions carry **one witness** regardless of `inputs_per_tx` (smaller than the initial batch built from distinct genesis keys).
 - `destination_signing_keys` (optional): Like `destination_signing_key` but a **list** of `.skey` paths. Outputs are distributed round-robin **by output index within each transaction**: output `i` pays to key `i mod n`, where `n` is the number of keys in the list, and each recycled fund keeps its destination's key. This makes multi-witness steady-state transactions *possible*, not guaranteed: a batch's witness count is however many distinct keys its inputs happen to carry, and that depends on queue order. With `inputs_per_tx = 2`, `outputs_per_tx = 2` and two keys, each transaction's A/B output pair re-enters the queue together, so batches typically alternate keys and carry two witnesses; but nothing enforces the alignment — a `recovery` reseed returns funds grouped by address (same-key stretches until the interleave re-forms), an `outputs_per_tx` that is not a multiple of `n` leaves same-key neighbours in the queue, and with `outputs_per_tx = 1` the index restarts at 0 every transaction so keys beyond the first are never used at all. Verify the achieved witness mix in the traces (tx sizes, or `Builder.NewTx` at `DMaximum`) rather than assuming it. All addresses are announced at startup (one line per builder), and a builder `recovery` queries all of them. Setting both the singular and the plural form is a startup error.
 
 A two-witness builder for a 2-in/2-out profile:
@@ -434,6 +504,7 @@ With `--dry-run`, tx-centrifuge performs all startup validation (config parsing,
 ## Detailed Examples
 
 ### 1. High-Throughput (On-Build Recycling)
+
 Optimized for maximum TPS using simple 1-in/1-out transactions. Outputs are recycled immediately after building (`on_build`), before the transaction enters the payload queue.
 
 **`config.json` snippet:**
@@ -444,7 +515,7 @@ Optimized for maximum TPS using simple 1-in/1-out transactions. Outputs are recy
     "genesis-funds": {
       "type": "genesis_utxo_keys",
       "params": {
-        "signing_keys_file": "funds.1.json"
+        "signing_keys_file": "funds.1.jsonl"
       }
     }
   },
@@ -473,15 +544,14 @@ Optimized for maximum TPS using simple 1-in/1-out transactions. Outputs are recy
 }
 ```
 
-**`funds.1.json` snippet:**
-```json
-[
-  {"signing_key": "utxo1.skey", "value": 1500000000000},
-  {"signing_key": "utxo2.skey", "value": 1500000000000}
-]
+**`funds.1.jsonl` snippet:**
+```
+{"signing_key": "utxo1.skey", "lovelace": 1500000000000}
+{"signing_key": "utxo2.skey", "lovelace": 1500000000000}
 ```
 
 ### 2. Large Transactions (Target-Specific Limits)
+
 Uses complex transactions with independent rate limits for each target connection. Outputs are recycled on fetch (`on_pull`).
 
 **`config.json` snippet:**
@@ -492,7 +562,7 @@ Uses complex transactions with independent rate limits for each target connectio
     "genesis-funds": {
       "type": "genesis_utxo_keys",
       "params": {
-        "signing_keys_file": "funds.2.json"
+        "signing_keys_file": "funds.2.jsonl"
       }
     }
   },
@@ -523,16 +593,15 @@ Uses complex transactions with independent rate limits for each target connectio
 }
 ```
 
-**`funds.2.json` snippet:**
-```json
-[
-  {"signing_key": "utxo1.skey", "value": 1000000000},
-  {"signing_key": "utxo2.skey", "value": 1000000000},
-  {"signing_key": "utxo3.skey", "value": 1000000000}
-]
+**`funds.2.jsonl` snippet:**
+```
+{"signing_key": "utxo1.skey", "lovelace": 1000000000}
+{"signing_key": "utxo2.skey", "lovelace": 1000000000}
+{"signing_key": "utxo3.skey", "lovelace": 1000000000}
 ```
 
 ### 3. Confirmation-Based Recycling (On-Confirm with Observer)
+
 Uses an observer that follows the chain to track when submitted transactions are confirmed on-chain. Outputs are only recycled back to the input queue after the transaction reaches a configured confirmation depth, protecting against mempool eviction and short rollbacks. Rolled-back transactions are held in limbo and orphaned (original inputs recycled) if they do not reappear within 2×`confirmation_depth` blocks.
 
 Two observer types are supported:
@@ -605,7 +674,7 @@ Both emit the same `BlockTx` events on the same broadcast channel type, so the d
     "genesis-funds": {
       "type": "genesis_utxo_keys",
       "params": {
-        "signing_keys_file": "funds.3.json"
+        "signing_keys_file": "funds.3.jsonl"
       }
     }
   },
@@ -645,13 +714,11 @@ Both emit the same `BlockTx` events on the same broadcast channel type, so the d
 }
 ```
 
-**`funds.3.json` snippet:**
-```json
-[
-  {"signing_key": "utxo1.skey", "value": 1500000000000},
-  {"signing_key": "utxo2.skey", "value": 1500000000000},
-  {"signing_key": "utxo3.skey", "value": 1500000000000}
-]
+**`funds.3.jsonl` snippet:**
+```
+{"signing_key": "utxo1.skey", "lovelace": 1500000000000}
+{"signing_key": "utxo2.skey", "lovelace": 1500000000000}
+{"signing_key": "utxo3.skey", "lovelace": 1500000000000}
 ```
 
 With `on_confirm`, the generator needs enough initial funds to cover the in-flight transactions between submission and confirmation. At 50 TPS with a 2-block confirmation depth (~40 seconds on a 20-second slot), roughly 2000 transactions will be pending at any time, so the initial fund pool should have at least that many UTxOs.

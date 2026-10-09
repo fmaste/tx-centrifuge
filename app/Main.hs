@@ -2,6 +2,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE NumericUnderscores #-}
@@ -23,9 +24,8 @@ module Main (main) where
 ----------
 import Control.Concurrent (threadDelay)
 import Control.Exception (finally)
-import Control.Monad (forever, when)
+import Control.Monad (foldM, forever, when)
 import Data.Bifunctor (first)
-import Data.List.NonEmpty qualified as NE
 import Data.Maybe (fromMaybe)
 import Data.Monoid (Last(..))
 import Numeric.Natural (Natural)
@@ -159,13 +159,29 @@ main = do
   -- Loand and validate config.
   -----------------------------
 
-  (isDryRun, validated, codecConfig, networkId, networkMagic, tracers) <-
-    loadConfig
+  (   isDryRun
+    , validated
+    , InitialFunds foldInitialFunds
+    , codecConfig
+    , networkId
+    , networkMagic
+    , tracers
+    ) <- loadConfig
 
-  -- Dry run: config, protocol and on-chain fund discovery have been validated,
-  -- so exit before creating resources or generating any traffic.
+  -- Dry run: config and protocol have been validated above, and the funds are
+  -- validated by running their fold, which is what reads the fund file or
+  -- queries the node.
   when isDryRun $ do
-    hPutStrLn stderr "Dry run OK: config and funds validated, exiting."
+    -- Folded into a count: no input queue exists yet, and none is created, so
+    -- this reads the funds and nothing else. The count is forced at every step
+    -- so a file of millions does not leave a chain of thunks behind.
+    fundCount <- foldInitialFunds
+      (\count _fund -> let count' = count + 1 in count' `seq` pure count')
+      (0 :: Natural)
+    when (fundCount == 0) $ die "initial_inputs: no funds loaded"
+    hPutStrLn stderr $
+         "Dry run OK: config and " ++ show fundCount
+      ++ " funds validated, exiting."
     exitSuccess
 
   -- Callbacks / handlers.
@@ -524,11 +540,14 @@ main = do
   withIOManager $ \ioManager -> do
     -- Resolve runtime: creates observers (via mkObserver), pipes, rate
     -- limiters, and spawns builders. All asyncs are linked and tracked.
+    -- The fund fold runs inside `resolve`, over the input queues it creates,
+    -- so the fund file is read and closed before the run starts.
     runtime <- Runtime.resolve
       mkBuilder
       mkPipeHandle
       mkRecyclerHandle
       (mkObserver ioManager)
+      foldInitialFunds
       validated
     -- Startup delay.
     -- Sleeps after the builders are already spawned and running so they keep
@@ -615,6 +634,19 @@ interpretInputSource raw = case Raw.inputSourceType raw of
 parseInitialKeys :: Aeson.Value -> Aeson.Types.Parser [FilePath]
 parseInitialKeys = Aeson.withObject "initial_inputs params" $ \o ->
   o .: "signing_keys"
+
+-- | A fold over the initial funds: the @initial_inputs@ source, interpreted
+-- and read. Announces what it is about to read and dies on a read error.
+--
+-- Boxed in a newtype because a @forall@ cannot be a tuple component, and this
+-- travels in 'loadConfig'\'s result. It stays polymorphic because its
+-- consumers pick different accumulators: 'Runtime.resolve' folds the funds
+-- into the input queues, the dry run folds them into a count.
+--
+-- A fold and not a list: a fund file streams, so with millions of entries only
+-- what the accumulator holds is held at once. The file is open for exactly as
+-- long as the fold runs.
+newtype InitialFunds = InitialFunds (Runtime.InputFold Fund.Fund)
 
 --------------------------------------------------------------------------------
 -- Builder interpretation.
@@ -775,7 +807,9 @@ instance Aeson.FromJSON ProtocolParameters where
 --------------------------------------------------------------------------------
 
 -- | Parse CLI args, load all configuration files, create protocol, generate a
--- signing key, load initial funds, and validate config.
+-- signing key, interpret where the initial funds come from, and validate
+-- config. The funds themselves are not read here: what comes back is the fold
+-- that reads them, which 'Runtime.resolve' runs over the input queues.
 --
 -- Returns a 'Validated.Config' (validated but not yet resolved into a
 -- 'Runtime.Runtime'). The caller is responsible for calling 'Runtime.resolve'
@@ -784,11 +818,26 @@ loadConfig
   :: IO ( -- | Whether this is a dry run: validate, then exit before traffic.
           Bool
           -- | Validated configuration (no STM resources yet).
-        , Validated.Config Fund.Fund
+        , Validated.Config
+          -- | Folds over the initial funds: where they come from, interpreted
+          -- and with its use-site params checked, read when folded.
+        , InitialFunds
           -- | Codec config for serialising blocks on the wire.
         , CodecConfig Block.CardanoBlock
+          -- | Network id, for cardano-api: it decides the network bit of every
+          -- address this generator derives, and so the pseudo-TxIn of a
+          -- genesis fund. Only mainnet-or-not reaches an address; the magic
+          -- itself never does.
         , Api.NetworkId
-          -- | Network magic for the handshake with cardano-node.
+          -- | Network magic, for the handshake with cardano-node: the exact
+          -- number, which is what the peer compares and refuses on.
+          --
+          -- Both come from one place, the magic in the node's genesis
+          -- ('protocolToNetworkMagic'), and either derives the other
+          -- ('Api.toNetworkMagic' one way, the mainnet-magic test in
+          -- 'protocolToNetworkId' the other). They are carried as both so that
+          -- no consumer has to convert: the fund and address code takes the
+          -- id, the connections take the magic.
         , Api.NetworkMagic
           -- | Logging / metrics tracers.
         , Tracing.Tracers
@@ -828,14 +877,13 @@ loadConfig = do
   networkId    <- protocolToNetworkId protocol
   networkMagic <- protocolToNetworkMagic protocol
 
-  -- Load initial funds. Look the initial_inputs source up in the raw config
-  -- (validate also checks the reference, but funds are loaded first, so a
-  -- missing name dies here), interpret it into the node-level FundSource ADT,
-  -- then obtain actual UTxO funds before validation: either from a genesis
-  -- signing-keys file, or by querying the node on chain. Each variant announces
-  -- itself and returns its loader's result. Handling that result (fail on error
-  -- or empty, report the count, build the non-empty list) is shared below.
-  funds <- do
+  -- Where the initial funds come from. Look the initial_inputs source up in
+  -- the raw config (validate also checks the reference, but the source is read
+  -- here first, so a missing name dies here), interpret it and check its
+  -- use-site params, all of it now, so a bad config dies at startup. No fund
+  -- is read here: that happens when someone runs the fold, either
+  -- 'Runtime.resolve' into the input queues or the dry run into a count.
+  initialFunds <- do
     let sourceName  = Raw.initialInputsSource (Raw.initialInputs raw)
         maybeParams = Raw.initialInputsParams (Raw.initialInputs raw)
     rawSource <-
@@ -843,47 +891,47 @@ loadConfig = do
         Nothing  -> die $
           "initial_inputs: undefined input source " ++ show sourceName
         Just src -> pure src
-    fundSource <- case interpretInputSource rawSource of
+    source <- case interpretInputSource rawSource of
       Left err  -> die $ "input_sources." ++ sourceName ++ ": " ++ err
       Right src -> pure src
-    result <- case fundSource of
-      GenesisKeysSource path -> do
-        -- The source is self-contained, reject use-site params instead of
-        -- silently ignoring them.
-        case maybeParams of
-          Just _  -> die $
-            "initial_inputs: a \"genesis_utxo_keys\" source takes no"
-            ++ " \"params\""
-          Nothing -> pure ()
-        hPutStrLn stderr $ "Loading funds from: " ++ path
-        Fund.loadFunds networkId path
-      UTxOQuerySource socketPath -> do
-        keyPaths <- case maybeParams of
-          Nothing -> die $
-            "initial_inputs: a \"utxo_query\" source needs \"params\" with"
-            ++ " the \"signing_keys\" to query under"
-          Just params ->
-            case Aeson.Types.parseEither parseInitialKeys params of
-              Left err    -> die $ "initial_inputs params: " ++ err
-              Right paths -> pure paths
-        hPutStrLn stderr $ "Querying UTxOs via N2C socket: " ++ socketPath
-        Fund.discoverFunds networkId socketPath keyPaths
-    case result of
-      Left err     -> die $ "initial_inputs: " ++ err
-      Right []     -> die "initial_inputs: no funds loaded"
-      Right (f:fs) -> do
-        let allFunds = f NE.:| fs
-        hPutStrLn stderr $ "  Loaded " ++ show (NE.length allFunds) ++ " funds"
-        pure allFunds
+    case source of
+      -- The source is self-contained, reject use-site params instead of
+      -- silently ignoring them.
+      GenesisKeysSource path -> case maybeParams of
+        Just _  -> die $
+          "initial_inputs: a \"genesis_utxo_keys\" source takes no \"params\""
+        Nothing -> pure (InitialFunds (\step seed -> do
+          hPutStrLn stderr $ "Loading funds from: " ++ path
+          Fund.foldFunds networkId path step seed
+            >>= either (\err -> die $ "initial_inputs: " ++ err) pure))
+      -- The source only knows how to query, the use site says what to query
+      -- for, so the keys are read here and travel with it.
+      UTxOQuerySource socketPath -> case maybeParams of
+        Nothing -> die $
+          "initial_inputs: a \"utxo_query\" source needs \"params\" with"
+          ++ " the \"signing_keys\" to query under"
+        Just params ->
+          case Aeson.Types.parseEither parseInitialKeys params of
+            Left err       -> die $ "initial_inputs params: " ++ err
+            -- The query answers with every fund at once, so here the fold is
+            -- a plain 'foldM' and the list is what is held.
+            Right keyPaths -> pure (InitialFunds (\step seed -> do
+              hPutStrLn stderr $
+                "Querying UTxOs via N2C socket: " ++ socketPath
+              funds <- Fund.discoverFunds networkId socketPath keyPaths
+                >>= either (\err -> die $ "initial_inputs: " ++ err) pure
+              foldM step seed funds))
 
   -- Validate config.
-  -- Pipeline: Raw → Validated (with pre-loaded funds).
-  validated <- either die pure $ Validated.validate raw funds
+  -- Pipeline: Raw → Validated (static data, the funds are not part of it).
+  validated <- either die pure $ Validated.validate raw
 
   -- Tracers.
   tracers <- TracingDispatcher.setupTracers configFile
 
-  pure ( isDryRun, validated, codecConfig, networkId, networkMagic, tracers )
+  pure ( isDryRun, validated, initialFunds
+       , codecConfig, networkId, networkMagic, tracers
+       )
 
 --------------------------------------------------------------------------------
 -- Protocol helpers (inlined from NodeConfig.hs and OuroborosImports.hs)

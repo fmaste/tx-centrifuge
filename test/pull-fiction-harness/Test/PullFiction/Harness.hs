@@ -34,7 +34,7 @@ module Test.PullFiction.Harness
 ----------
 import Control.Concurrent (threadDelay)
 import Control.Exception (onException, throwIO)
-import Control.Monad (forever, when)
+import Control.Monad (foldM, forever, when)
 import Data.IORef qualified as IORef
 import Data.List (intercalate)
 import Data.List.NonEmpty qualified as NE
@@ -107,7 +107,7 @@ nodeName i = "node-" ++ (if i < 10 then "0" else "") ++ show i
 resolveConfig :: FilePath -> NE.NonEmpty input -> IO (Runtime.Runtime Int input input)
 resolveConfig path inputs = do
   raw <- Aeson.eitherDecodeFileStrict path >>= either fail pure
-  validated <- either fail pure $ Validated.validate raw inputs
+  validated <- either fail pure $ Validated.validate raw
   -- Unique per-payload key (a plain counter). The recycler keys its backlog
   -- by it, so each in-flight payload must have a distinct key (see the
   -- INVARIANT on 'Internal.Recycler'); one shared atomic counter keeps them
@@ -136,6 +136,9 @@ resolveConfig path inputs = do
       })
     -- mkObserver: no test config uses observers.
     (\_ name _ -> fail $ "resolveConfig: unexpected observer: " ++ name)
+    -- The initial inputs are already in memory, so the fold is a plain
+    -- 'foldM' over them.
+    (\step seed -> foldM step seed (NE.toList inputs))
     validated
 
 -- | Load a generator config from a JSON file with dummy inputs and resolve into
@@ -257,9 +260,10 @@ runTpsTest configPath durationSecs = do
 --
 -- Inputs are @(Int, Int)@ tuples where the first element is the workload index
 -- and the second is an input identifier within that workload.
--- 'Runtime.resolve' partitions inputs in ascending workload-key order, so
--- workload @i@ (0-based by key order) receives only inputs whose first element
--- is @i@. This also tests the partition logic itself.
+-- 'Runtime.resolve' deals the inputs round-robin over the queues in ascending
+-- workload-key order, so they are generated interleaved: the input at position
+-- @p@ is tagged @p \`mod\` nWorkloads@, which is the workload whose queue it
+-- lands on. This also tests the distribution itself.
 --
 -- If any worker observes an input with a foreign workload tag, the test fails
 -- immediately. Both 'fetchPayload' (blocking) and 'tryFetchPayload'
@@ -274,17 +278,19 @@ runPipelineIsolationTest
   -> IO ()
 runPipelineIsolationTest configPath nWorkloads durationSecs = do
   let inputsPerWorkload = 2000
+      -- Workload index innermost: one input per workload at a time, so
+      -- position @p@ carries tag @p `mod` nWorkloads@.
       taggedInputs =
         [ (i, j)
-        | i <- [0 :: Int .. nWorkloads - 1]
-        , j <- [0 :: Int .. inputsPerWorkload - 1]
+        | j <- [0 :: Int .. inputsPerWorkload - 1]
+        , i <- [0 :: Int .. nWorkloads - 1]
         ]
   inputs <- case taggedInputs of
     (t:ts) -> pure (t NE.:| ts)
     []     -> fail "runPipelineIsolationTest: nWorkloads must be >= 1"
   runtime <- resolveConfig configPath inputs
-  -- Workloads are stored in a Map, so keys are ascending.
-  -- resolve partitions contiguous chunks in the same order.
+  -- Workloads are stored in a Map, so keys are ascending, the order resolve
+  -- deals the inputs in.
   let nameToTag = Map.fromList $
         zip (Map.keys (Runtime.workloads runtime)) [0 :: Int ..]
   -- Workers: fetch payload (= input tag), assert it matches the workload.

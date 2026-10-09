@@ -35,7 +35,7 @@ module PullFiction.Config.Validated
   (
     -- * Config.
     Config
-  , initialInputs, initialInputsScope, inputSources
+  , initialInputsScope, inputSources
   , observers
   , workloads
   , payloadQueueCapacity
@@ -66,7 +66,6 @@ module PullFiction.Config.Validated
 -- base --
 ----------
 import Control.Monad (when)
-import Data.List.NonEmpty (NonEmpty)
 import Data.Maybe (fromMaybe, isJust)
 import Numeric.Natural (Natural)
 ----------------
@@ -130,13 +129,13 @@ defaultStartupDelaySeconds = 0
 --
 -- See 'Raw.Config' for field semantics. All invariants have been checked and
 -- cascading defaults applied by 'validate'.
-data Config input = Config
-  { -- | Initial inputs provided by the caller and stored by 'validate'.
-    initialInputs :: !(NonEmpty input)
-    -- | Resolved scope of 'initialInputs': how many input queues they are split
-    -- into, and so which workloads share one (see 'Raw.InputsScope').
-    -- Applied by 'Config.Runtime'.
-  , initialInputsScope :: !Raw.InputsScope
+data Config = Config
+  { -- | Resolved scope of the initial inputs: how many input queues they are
+    -- split into, and so which workloads share one (see 'Raw.InputsScope').
+    -- Applied by 'Config.Runtime', which is also where the inputs themselves
+    -- enter: they are folded into the queues as those are created, not
+    -- carried here.
+    initialInputsScope :: !Raw.InputsScope
     -- | Input sources (keyed by name).
     -- Opaque; interpretation is the caller's responsibility.
   , inputSources  :: !(Map String Raw.InputSource)
@@ -224,18 +223,17 @@ data Target = Target
 -- | Validate a 'Raw.Config', enforce all business rules, and cascade top-level
 -- defaults into workloads.
 --
--- Input loading is the caller's responsibility; passes the already-loaded
--- inputs directly. This keeps the validation layer pure and decouples it from
--- IO concerns like key loading and network magic interpretation.
+-- Nothing about the inputs themselves is here: they are the caller's to
+-- obtain and 'Config.Runtime' folds them into the queues it creates. That
+-- keeps this layer pure static data, with no IO concern such as key loading or
+-- network magic interpretation.
 --
 -- Returns 'Left' with a descriptive error message on the first violation.
 validate
   -- | Raw configuration as parsed from JSON.
   :: Raw.Config
-  -- | Initial inputs (already loaded by the caller).
-  -> NonEmpty input
-  -> Either String (Config input)
-validate raw inputs = do
+  -> Either String Config
+validate raw = do
   -- Input sources. Always top-level and by name.
   -- (opaque; passed through without interpretation).
   let resolvedSources = fromMaybe
@@ -295,17 +293,6 @@ validate raw inputs = do
   let inputsScope = fromMaybe
                       defaultInputsScope -- Default value.
                       (Raw.initialInputsScope (Raw.initialInputs raw))
-  -- Inputs must cover all input queues: Runtime.partitionInputs splits them
-  -- into contiguous chunks, one per queue, so fewer inputs than queues leaves
-  -- some with zero. "shared" makes one queue in total, "per_workload" one queue
-  -- per workload.
-  let inputQueueCount = case inputsScope of
-        Raw.InputsShared      -> 1
-        Raw.InputsPerWorkload -> Map.size workloadsMap
-      inputCount = length inputs
-  when (inputCount < inputQueueCount) $
-    Left $ "Config: not enough initial inputs (" ++ show inputCount
-        ++ ") for " ++ show inputQueueCount ++ " input queue(s)"
   -- A recovery and an input queue shared by more than one workload are mutually
   -- exclusive. The recovery's reset drops every input queued on it and reseeds
   -- from one workload's own UTxO query, so the others lose theirs for good. One
@@ -348,8 +335,7 @@ validate raw inputs = do
                        (Raw.maybeStartupDelaySeconds raw)
   -- Final validated config.
   pure Config
-    { initialInputs        = inputs
-    , initialInputsScope   = inputsScope
+    { initialInputsScope   = inputsScope
     , inputSources         = resolvedSources
     , observers            = resolvedObservers
     , workloads            = workloadsMap

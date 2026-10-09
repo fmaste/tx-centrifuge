@@ -123,9 +123,9 @@ buildTx sbe destinations inFunds numOutputs fee
                            txBody
                            (map Api.WitnessPaymentKey uniqueKeys)
               txId = Api.getTxId txBody
-              outFunds = [ Fund { fundTxIn    = Api.TxIn txId (Api.TxIx ix)
-                                , fundValue   = amt
-                                , fundSignKey = fst (destinationFor ix)
+              outFunds = [ Fund { fundTxIn     = Api.TxIn txId (Api.TxIx ix)
+                                , fundLovelace = amt
+                                , fundSignKey  = fst (destinationFor ix)
                                 }
                          | (ix, amt) <- zip [0..] outAmounts
                          ]
@@ -133,7 +133,7 @@ buildTx sbe destinations inFunds numOutputs fee
   where
 
     totalIn :: Integer
-    totalIn = sum (map fundValue inFunds)
+    totalIn = sum (map fundLovelace inFunds)
 
     feeLovelace :: Integer
     feeLovelace = let L.Coin c = fee in c
