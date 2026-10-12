@@ -20,13 +20,20 @@ echo "------------------------------------------------------------"
 echo ""
 nix build --no-link --print-out-paths .#tx-centrifuge \
   --override-input cardano-node github:IntersectMBO/cardano-node/c2ebdc87dfe07706a83e52f219e712c60d1b0a56
+#echo ""
+#echo "------------------------------------------------------------"
+#echo "Building with cardano-node \"leios-protoype\" (2026-09-28) ..."
+#echo "------------------------------------------------------------"
+#echo ""
+#nix build --no-link --print-out-paths .#tx-centrifuge \
+#  --override-input cardano-node github:IntersectMBO/cardano-node/8bb6b68d80a8a4fb1904c48805be4f3a516593e
 echo ""
 echo "------------------------------------------------------------"
-echo "Building with cardano-node \"leios-protoype\" (2026-09-28) ..."
+echo "Building with cardano-node \"leios-protoype\" (2026-10-11) ..."
 echo "------------------------------------------------------------"
 echo ""
 nix build --no-link --print-out-paths .#tx-centrifuge \
-  --override-input cardano-node github:IntersectMBO/cardano-node/8bb6b68d80a8a4fb1904c48805be4f3a516593e
+  --override-input cardano-node github:IntersectMBO/cardano-node/715b8d2a649e1b97263b3854127d3cff5b09ab8e
 echo ""
 echo "------------------------------------------------------------"
 echo "Builiding as repo says ..."

@@ -175,22 +175,33 @@ emptyClients = Clients
 -- changes with the "ouroboros-consensus" it is built against.
 --
 -- The released "ouroboros-consensus" 3.0.1 gives `NetN2N.Codecs` seven payload
--- parameters. Two later versions add two mini-protocols each, for unrelated
--- reasons, taking it to nine:
+-- parameters. Two mini-protocol pairs were added since, for unrelated reasons,
+-- two parameters each:
 --
---   "ouroboros-consensus" 4                     Peras, `bPCD` and `bPVD`
---   the "ouroboros-consensus" pinned            Leios, `bLN` and `bLF`
---   by "cardano-node" branch "leios-prototype"
+--   Peras, `bPCD` and `bPVD`   from "ouroboros-consensus" 4 on, so a version
+--                              test sees it
+--   Leios, `bLN` and `bLF`     only in the "ouroboros-consensus" pinned by
+--                              "cardano-node" branch "leios-prototype", which
+--                              no version number reveals, so the cabal flag
+--                              `leios-prototype` marks it
 --
--- All nine parameters are `BSL.ByteString` here, so one branch serves both.
+-- That branch carries both, so the flag alone selects eleven. It carried Leios
+-- alone while numbered 3.0.1, the number of the release with seven parameters,
+-- which is why the flag exists; that revision is no longer supported.
+--
+-- Every payload parameter is `BSL.ByteString` here, so only the count matters.
 -- Consensus publishes no synonym to hide the arity, and every signature below
 -- needs the type, so this is the one place that changes.
---
--- The Leios one is numbered 3.0.1, the same as the release with seven
--- parameters, so no version test can tell them apart. It is recognised by the
--- cabal flag `leios-prototype` instead, which the flake sets when the
--- "cardano-node" it is pointed at is that branch.
-#if MIN_VERSION_ouroboros_consensus(4,0,0) || defined(LEIOS_PROTOTYPE)
+#ifdef LEIOS_PROTOTYPE
+-- Peras and Leios.
+type N2NCodecs =
+  NetN2N.Codecs Chain.CardanoBlock NtN.RemoteAddress
+    Serialise.DeserialiseFailure IO
+    BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
+    BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
+    BSL.ByteString BSL.ByteString BSL.ByteString
+#elif MIN_VERSION_ouroboros_consensus(4,0,0)
+-- Peras only.
 type N2NCodecs =
   NetN2N.Codecs Chain.CardanoBlock NtN.RemoteAddress
     Serialise.DeserialiseFailure IO
@@ -198,6 +209,7 @@ type N2NCodecs =
     BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
     BSL.ByteString
 #else
+-- Neither.
 type N2NCodecs =
   NetN2N.Codecs Chain.CardanoBlock NtN.RemoteAddress
     Serialise.DeserialiseFailure IO

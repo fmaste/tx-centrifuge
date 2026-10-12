@@ -15,7 +15,7 @@
 --
 -- The query era is detected at runtime ('Api.QueryCurrentEra') rather than
 -- hardcoded, so it follows the chain across the Shelley-based eras cardano-api
--- supports (Shelley through Conway today). Results are keyed by the caller's
+-- supports (Shelley through Dijkstra today). Results are keyed by the caller's
 -- own 'Api.AddressInEra' values, so it looks funds up with the very addresses
 -- it passed in and never touches the era-agnostic 'Api.AddressAny' projection
 -- used internally to join the node's reply back to those addresses.
@@ -104,7 +104,7 @@ runQuery connectInfo inputByAny = do
     Left acqFailure ->
       pure $ Left $ "QueryCurrentEra acquire failed: " ++ show acqFailure
     Right (Api.AnyCardanoEra era) ->
-      Api.caseByronOrShelleyBasedEra
+      Api.inEonForEra
         (pure $ Left
           "node is in the Byron era, UTxO discovery needs a Shelley-based era"
         )

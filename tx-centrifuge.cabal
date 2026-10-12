@@ -29,16 +29,17 @@ data-files:       data/config-shared-10.json
 
 -- Says that the pinned "cardano-node" is in the "leios-prototype" branch.
 -- That branch pins an "ouroboros-consensus" and an "ouroboros-network" carrying
--- API changes that no version number reveals: both keep the version of the
--- release they forked from. "NodeToNode.hs" has three of them so far, listed
--- there. A version bound cannot see this and neither can the solver, so it is
--- declared.
+-- API changes that no version number reveals: the Leios mini-protocols are in
+-- no release, whatever version the branch reports (5.1.0.1 today, 3.0.1 when
+-- it forked).
+-- "NodeToNode.hs" has three of them so far, listed there. A version bound
+-- cannot see this and neither can the solver, so it is declared.
 -- The flake sets this flag when the "cardano-node" it is pointed at is that
 -- branch. For a plain cabal build against it, pass `--flag=+leios-prototype`.
 flag leios-prototype
   description:        The pinned cardano-node is its leios-prototype branch,
-                      whose consensus and network libraries differ from the
-                      releases they share a version number with.
+                      whose consensus and network libraries carry
+                      mini-protocols that no release has.
   default:            False
   manual:             True
 
