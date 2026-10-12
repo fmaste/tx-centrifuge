@@ -81,9 +81,9 @@ data Tracers = Tracers
   , trPipe :: !(Tracer IO PipeTrace)
     -- | Recycler trace: payloads added to the backlog ('AddToBacklog'),
     -- recycled inputs added back onto a pipe's input queue ('AddToPipe') and
-    -- input queue resets ('Reset'). Every event emits the backlog size
-    -- ('backlog'), adds counts at DDetailed and above, and the full inputs at
-    -- DMaximum.
+    -- input queue resets ('Reset'). Every event emits the recycler's name,
+    -- then the backlog size ('backlog') and the counts from DNormal, and the
+    -- payload key and the fund arrays from DDetailed.
   , trRecycler :: !(Tracer IO RecyclerTrace)
     -- | Observer trace: on-chain transaction confirmation/rollback events.
   , trObserver :: !(Tracer IO ObserverTrace)
@@ -185,7 +185,7 @@ data BuilderTrace
     --
     -- * 'String': builder name (the workload name).
     -- * 'Chain.TxKey': the transaction's identifiers as @buildTx@ derived
-    --   them, both at every detail level. The payload-side events carry the
+    --   them, from @DNormal@ (@DMinimal@ is the builder name alone). The payload-side events carry the
     --   same key but only at @DMaximum@ ('PipeTrace', 'RecyclerTrace'), and an
     --   observer's key has both only when it read the transaction from a
     --   ranking (Praos) block body: read from an endorser (Leios) block there
@@ -209,8 +209,9 @@ data BuilderTrace
     -- builder loop, not recycled) and the service stays up.
     --
     -- * 'String': builder name (the workload name).
-    -- * @['Fund.Fund']@: the dropped input funds.
-    -- * 'String': the reason (the @buildTx@ error string).
+    -- * @['Fund.Fund']@: the dropped input funds (from @DDetailed@).
+    -- * 'String': the reason, the @buildTx@ error string (from @DNormal@, so
+    --   @DMinimal@ is the builder name alone).
     BuilderInputsDropped !String [Fund.Fund] !String
 
 --------------------------------------------------------------------------------
@@ -231,20 +232,20 @@ data BuilderTrace
 -- are the same.
 data PipeTrace
   = -- | Inputs were added to the input queue. 'Natural' is the input-queue
-    -- depth right after. @[Fund.Fund]@ is the inputs added (their count is
-    -- emitted at @DDetailed@ and above, their full data at
-    -- @DMaximum@).
+    -- depth right after, emitted from @DNormal@. @[Fund.Fund]@ is the inputs
+    -- added (their count from @DNormal@, the array itself from @DDetailed@).
     PipeInputsEnqueued  !String !Natural [Fund.Fund]
     -- | Inputs were removed from the input queue (taken by the builder).
-    -- 'Natural' is the input-queue depth right after. @[Fund.Fund]@ is the
-    -- inputs removed (count at @DDetailed@ and above, full data at
-    -- @DMaximum@).
+    -- 'Natural' is the input-queue depth right after, emitted from @DNormal@.
+    -- @[Fund.Fund]@ is the inputs removed (count from @DNormal@, the array
+    -- itself from @DDetailed@).
   | PipeInputsDequeued  !String !Natural [Fund.Fund]
     -- | A payload was added to the payload queue. 'Natural' is the
     -- payload-queue depth right after the write. The 'Chain.TxKey' is the
     -- payload's own key, so both identifiers: an observer's report is matched
     -- against it by the hash alone and need not carry the id (see
-    -- 'Chain.TxKey'). Emitted only at @DMaximum@.
+    -- 'Chain.TxKey'). Emitted from @DDetailed@, the level at which the input
+    -- events name their funds.
   | PipePayloadEnqueued !String !Natural !Chain.TxKey
     -- | A payload was removed from the payload queue (pulled by a worker).
     -- 'Natural' is the payload-queue depth observed shortly after the pull
@@ -261,8 +262,9 @@ data PipeTrace
 -- until a release picks a set, then adds it back onto a pipe's input queue
 -- (closing the loop). It reports each add of a payload's entry to its
 -- backlog ('RecyclerAddToBacklog': the key and both input sets), each add of
--- inputs to a pipe ('RecyclerAddToPipe': which inputs were added, by which
--- recycler, into which queue) and each reset of a pipe ('RecyclerReset'). The
+-- inputs to a pipe ('RecyclerAddToPipe': which payload was released and which
+-- inputs that added, by which recycler, into which queue) and each reset of a
+-- pipe ('RecyclerReset'). The
 -- 'String' names are the recycler and (on 'RecyclerAddToPipe' and
 -- 'RecyclerReset') the input queue it recycles into, which is why they are
 -- recorded separately: one recycler per workload, but the input queue can be
@@ -272,16 +274,22 @@ data RecyclerTrace
   = -- | A payload's entry was added to the backlog: its key and its two
     -- input sets, held until a release picks one. 'String' is the recycler
     -- name, 'Natural' the resulting backlog size, the 'Chain.TxKey' the
-    -- payload's key, first @[Fund.Fund]@ the consumed inputs,
-    -- second the produced outputs (counts at @DDetailed@ and above, key and
-    -- full data at @DMaximum@).
+    -- payload's key, first @[Fund.Fund]@ the consumed inputs, second the
+    -- produced outputs (counts from @DNormal@, the key and the fund arrays
+    -- from @DDetailed@).
     RecyclerAddToBacklog
       !String !Natural !Chain.TxKey [Fund.Fund] [Fund.Fund]
-    -- | Recycled inputs were added back onto a pipe's input queue. First
-    -- 'String' is the recycler name, second 'String' the input queue, 'Natural'
-    -- the resulting backlog size, @[Fund.Fund]@ the added inputs (count at
-    -- @DDetailed@ and above, full data at @DMaximum@).
-  | RecyclerAddToPipe !String !String !Natural [Fund.Fund]
+    -- | A held payload was released: its recycled inputs went back onto a
+    -- pipe's input queue. First 'String' is the recycler name, second 'String'
+    -- the input queue, 'Natural' the resulting backlog size, the 'Chain.TxKey'
+    -- the released payload's key, @[Fund.Fund]@ the added inputs (count from
+    -- @DNormal@, the key and the fund array from @DDetailed@).
+    --
+    -- The key is the one 'RecyclerAddToBacklog' carried for that payload, so
+    -- the two pair up: how long it waited for its confirmation is the time
+    -- between them.
+  | RecyclerAddToPipe
+      !String !String !Natural !Chain.TxKey [Fund.Fund]
     -- | The recycler reset a pipe's input queue: the queued inputs were
     -- discarded, the payloads built from them were dropped from the payload
     -- queue, and the input queue was reseeded with fresh inputs (a builder's
@@ -289,8 +297,7 @@ data RecyclerTrace
     -- input queue, 'Natural' the resulting backlog size (always @0@, a reset
     -- clears the backlog), the third list the dropped queued payloads by key,
     -- first @[Fund.Fund]@ the dropped inputs, second the fresh ones added to
-    -- the queue (counts at @DDetailed@ and above, full data at
-    -- @DMaximum@).
+    -- the queue (counts from @DNormal@, the arrays from @DDetailed@).
   | RecyclerReset
       !String !String !Natural [Chain.TxKey] [Fund.Fund] [Fund.Fund]
 
@@ -300,14 +307,30 @@ data RecyclerTrace
 
 -- | Observer events. Logged entirely in @Main.hs@ from the observer's on-chain
 -- confirmation stream, decoupled from the pipe and from recycling.
+-- Confirmed and orphaned are separate constructors, and so separate
+-- namespaces, because they differ by orders of magnitude in volume and in
+-- interest: a confirmation is one line per chain transaction per observer and
+-- an orphan is a rare event worth a 'Warning'. One namespace could only be
+-- configured for both at once.
 data ObserverTrace
-  = -- | The observer saw a transaction confirmed or orphaned (rolled back).
+  = -- | The observer saw a transaction confirmed.
     --
     -- * 'String': observer name (from the config's @\"observers\"@ object).
-    -- * 'Chain.TxKey': the confirmed/orphaned transaction, by the identifier
-    --   the observer read.
-    -- * 'Bool': @True@ if orphaned (rolled back), @False@ if confirmed.
-    ObserverAnnounce !String !Chain.TxKey !Bool
+    -- * 'Chain.TxKey': the transaction, by the identifier the observer read,
+    --   from @DNormal@ (@DMinimal@ is the observer name alone).
+    -- * 'Chain.BlockNo' and 'Chain.SlotNo': where on the chain it was seen,
+    --   from @DDetailed@. Always a ranking block's, and for a transaction that
+    --   came from an endorser block the /certifying/ block's, since that is
+    --   where an EB's transactions enter the chain.
+    ObserverConfirmed !String !Chain.TxKey !Chain.BlockNo !Chain.SlotNo
+  | -- | The observer saw a transaction orphaned: it was in a block that was
+    -- rolled back and did not reappear within the confirmation window.
+    --
+    -- * 'String': observer name.
+    -- * 'Chain.TxKey': the transaction, as in 'ObserverConfirmed'.
+    -- * 'Chain.BlockNo' and 'Chain.SlotNo': the block it had been seen in,
+    --   the one that was rolled back, as in 'ObserverConfirmed'.
+    ObserverOrphaned !String !Chain.TxKey !Chain.BlockNo !Chain.SlotNo
 
 --------------------------------------------------------------------------------
 -- TxSubmission trace messages
@@ -319,7 +342,12 @@ data ObserverTrace
 -- verify.
 --
 -- Every constructor carries a @target@ field identifying the remote node: the
--- name of the target it was configured under.
+-- name of the target it was configured under, which is the whole line at
+-- @DMinimal@. The ACK and REQ counts come from @DNormal@, and on 'ReplyTxIds'
+-- they are the ones in the request it answers, echoed. What we announced or
+-- sent with its sizes comes from @DDetailed@, and the bare identifier lists at
+-- @DMaximum@, which is where hex-encoding every identifier on every round-trip
+-- is paid for.
 data TxSubmission
   = -- | The node asked for transaction identifiers (@MsgRequestTxIds@).
     --
@@ -331,8 +359,9 @@ data TxSubmission
     -- | We replied to @MsgRequestTxIds@ with TxId\/size pairs.
     --
     -- * 'String':                 target node name.
-    -- * 'Int':                    TxIds the node is acknowledging (ACK).
-    -- * 'Int':                    new TxIds the node is requesting (REQ).
+    -- * 'Int':                    the ACK of the request this answers.
+    -- * 'Int':                    the REQ of that same request, so REQ minus
+    --                             the pairs below is demand it did not meet.
     -- * @['Chain.TxId']@:         updated unacked TxIds (after ACK and the
     --                             new announcements).
     -- * @[('Chain.TxId','Int')]@: TxIds we announced in this reply, with

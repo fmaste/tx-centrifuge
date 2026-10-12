@@ -224,6 +224,132 @@ defaultTraceConfig = Logging.emptyTraceConfig
   }
 
 --------------------------------------------------------------------------------
+-- Fields by detail level
+--------------------------------------------------------------------------------
+
+-- Every 'forMachine' below, field by field and level by level. "-" is absent.
+-- Shapes: str a string, int a number, bool a boolean, hex 64 hex characters
+-- (a TxId or a TxHash), [ref] an array of "<txid>#<ix>" strings, [obj] an
+-- array of {"utxo","lovelace"} objects, [idsz] an array of {"id","size"},
+-- [addr] an array of bech32 addresses. A fund array is [ref] at DDetailed and
+-- [obj] at DMaximum, which is 'renderFund' following the level it is given.
+--
+--   Builder.NewTx (Info)                  Min    Nor    Det    Max
+--     builder                             str    str    str    str
+--     txHash, txId                        -      hex    hex    hex
+--     inputs, outputs                     -      -      [ref]  [obj]
+--     destinations                        -      -      -      [addr]
+--
+--   Builder.InputsDropped (Warning)       Min    Nor    Det    Max
+--     builder                             str    str    str    str
+--     reason                              -      str    str    str
+--     inputs                              -      -      [ref]  [obj]
+--
+--   Pipe.Inputs.Enqueued (Info)           Min    Nor    Det    Max
+--   Pipe.Inputs.Dequeued (Info)
+--     pipe                                str    str    str    str
+--     depth                               -      int    int    int
+--     count                               -      int    int    int
+--     inputs                              -      -      [ref]  [obj]
+--
+--   Pipe.Payload.Enqueued (Info)          Min    Nor    Det    Max
+--   Pipe.Payload.Dequeued (Info)
+--     pipe                                str    str    str    str
+--     depth                               -      int    int    int
+--     txHash, txId                        -      -      hex    hex
+--
+--   Recycler.AddToBacklog (Info)          Min    Nor    Det    Max
+--     recycler                            str    str    str    str
+--     backlog                             -      int    int    int
+--     consumed_count, outputs_count       -      int    int    int
+--     txHash, txId                        -      -      hex    hex
+--     consumed, outputs                   -      -      [ref]  [obj]
+--
+--   Recycler.AddToPipe (Info)             Min    Nor    Det    Max
+--     recycler, pipe                      str    str    str    str
+--     backlog                             -      int    int    int
+--     count                               -      int    int    int
+--     txHash, txId                        -      -      hex    hex
+--     inputs                              -      -      [ref]  [obj]
+--
+--   Recycler.Reset (Warning)              Min    Nor    Det    Max
+--     recycler, pipe                      str    str    str    str
+--     backlog (always 0)                  -      int    int    int
+--     fresh_count                         -      int    int    int
+--     dropped_inputs_count                -      int    int    int
+--     dropped_payloads_count              -      int    int    int
+--     fresh, dropped_inputs               -      -      [ref]  [obj]
+--     dropped_payloads                    -      -      [hex]  [hex]
+--
+--   Observer.Announce.Confirmed (Info)    Min    Nor    Det    Max
+--   Observer.Announce.Orphaned (Warning)
+--     observer                            str    str    str    str
+--     txHash, txId                        -      hex    hex    hex
+--     blockNo, slotNo                     -      -      int    int
+--
+--   TxSubmission.RequestTxIds (Info)      Min    Nor    Det    Max
+--     target                              str    str    str    str
+--     ack, req                            -      int    int    int
+--     unacked                             -      -      -      [hex]
+--
+--   TxSubmission.ReplyTxIds (Info)        Min    Nor    Det    Max
+--     target                              str    str    str    str
+--     ack, req (the request's)            -      int    int    int
+--     txs                                 -      -      [idsz] [idsz]
+--     unacked                             -      -      -      [hex]
+--
+--   TxSubmission.RequestTxs (Info)        Min    Nor    Det    Max
+--     target                              str    str    str    str
+--     txIds                               -      -      -      [hex]
+--
+--   TxSubmission.ReplyTxs (Info)          Min    Nor    Det    Max
+--     target                              str    str    str    str
+--     txs                                 -      -      [idsz] [idsz]
+--     requested                           -      -      -      [hex]
+--
+-- The two protocol traces copied from cardano-node do not gate on the level:
+-- TxSubmission2.{MsgInit, RequestTxIds, ReplyTxIds, RequestTxs, ReplyTxs,
+-- Done} and KeepAlive.{KeepAlive, KeepAliveResponse, Done} (all Debug) carry
+-- str "kind" and str "agency" at every level, plus a str "txIds" on
+-- MsgRequestTxs and a str "txs" on MsgReplyTxs, both Haskell 'show' output
+-- rather than JSON arrays.
+--
+-- A txId is absent at every level when the key has none, which is a key read
+-- from an endorser block (see 'Chain.TxKey').
+
+--------------------------------------------------------------------------------
+-- Shared rendering
+--------------------------------------------------------------------------------
+
+-- | Render a payload key as machine-format fields: @txHash@ always, @txId@
+-- when the key has one (see 'Chain.TxKey'). Both are 32 bytes of hex, so the
+-- field is the only thing that says which is which.
+renderTxKey :: Chain.TxKey -> Object
+renderTxKey txKey = mconcat $
+     [ "txHash" .= String (Hash.hashToTextAsHex (Chain.txKeyHash txKey)) ]
+  ++ [ "txId"   .= String (Api.serialiseToRawBytesHexText txId)
+     | Just txId <- [Chain.txKeyId txKey]
+     ]
+
+-- | Render a single fund for 'forMachine' output.
+--
+-- * Below 'Logging.DMaximum': just the UTxO reference as a string
+--   (@\"\<txid\>#\<ix\>\"@).
+-- * 'Logging.DMaximum': a JSON object with @\"utxo\"@ and @\"lovelace\"@ fields.
+renderFund :: Logging.DetailLevel -> Fund.Fund -> Value
+renderFund dtal fund
+  | dtal >= Logging.DMaximum =
+      object [ "utxo"     .= Api.renderTxIn (Fund.fundTxIn fund)
+             , "lovelace" .= Fund.fundLovelace fund
+             ]
+  | otherwise =
+      String (Api.renderTxIn (Fund.fundTxIn fund))
+
+-- | Render a list of funds as comma-separated @\"\<txid\>#\<ix\>\"@ references.
+renderFundTxIns :: [Fund.Fund] -> Text.Text
+renderFundTxIns = Text.intercalate "," . map (Api.renderTxIn . Fund.fundTxIn)
+
+--------------------------------------------------------------------------------
 -- Builder trace rendering
 --------------------------------------------------------------------------------
 
@@ -249,9 +375,13 @@ instance Logging.MetaTrace BuilderTrace where
 -- | Machine-readable ('forMachine') and human-readable ('forHuman') rendering
 -- of 'BuilderTrace' messages.
 --
--- Machine format ('Logging.DNormal'): both of the transaction's names, the
--- @txId@ that a ranking block's body gives it and the @txHash@ that an
--- endorser block lists it under.
+-- Machine format ('Logging.DMinimal'): the builder only, which for
+-- 'BuilderInputsDropped' is the whole line.
+--
+-- Machine format ('Logging.DNormal'): adds both of the transaction's
+-- identifiers, the @txId@ that a ranking block's body gives it and the
+-- @txHash@ that an endorser block lists it under (and, for
+-- 'BuilderInputsDropped', the @reason@).
 --
 -- @
 -- { \"builder\": \"workload-name\"
@@ -294,8 +424,9 @@ instance Logging.MetaTrace BuilderTrace where
 -- @
 instance Logging.LogFormatting BuilderTrace where
   forMachine dtal (BuilderNewTx name txKey dests inputs outputs) = mconcat $
-       [ "builder" .= name
-       , renderTxKey txKey
+       [ "builder" .= name ]
+    ++ [ renderTxKey txKey
+       | dtal >= Logging.DNormal
        ]
     ++ [ "destinations" .= map Api.serialiseAddress dests
        | dtal >= Logging.DMaximum
@@ -307,8 +438,9 @@ instance Logging.LogFormatting BuilderTrace where
        | dtal >= Logging.DDetailed
        ]
   forMachine dtal (BuilderInputsDropped name inputs reason) = mconcat $
-       [ "builder" .= name
-       , "reason"  .= reason
+       [ "builder" .= name ]
+    ++ [ "reason"  .= reason
+       | dtal >= Logging.DNormal
        ]
     ++ [ "inputs" .= map (renderFund dtal) inputs
        | dtal >= Logging.DDetailed
@@ -323,107 +455,87 @@ instance Logging.LogFormatting BuilderTrace where
     <> "reason=" <> Text.pack reason
     <> " inputs=[" <> renderFundTxIns inputs <> "]"
 
--- | Render a payload key as machine-format fields: @txHash@ always, @txId@
--- when the key has one (see 'Chain.TxKey'). Both are 32 bytes of hex, so the
--- field is the only thing that says which is which.
-renderTxKey :: Chain.TxKey -> Object
-renderTxKey txKey = mconcat $
-     [ "txHash" .= String (Hash.hashToTextAsHex (Chain.txKeyHash txKey)) ]
-  ++ [ "txId"   .= String (Api.serialiseToRawBytesHexText txId)
-     | Just txId <- [Chain.txKeyId txKey]
-     ]
-
--- | Render a single fund for 'forMachine' output.
---
--- * Below 'Logging.DMaximum': just the UTxO reference as a string
---   (@\"\<txid\>#\<ix\>\"@).
--- * 'Logging.DMaximum': a JSON object with @\"utxo\"@ and @\"lovelace\"@ fields.
-renderFund :: Logging.DetailLevel -> Fund.Fund -> Value
-renderFund dtal fund
-  | dtal >= Logging.DMaximum =
-      object [ "utxo"     .= Api.renderTxIn (Fund.fundTxIn fund)
-             , "lovelace" .= Fund.fundLovelace fund
-             ]
-  | otherwise =
-      String (Api.renderTxIn (Fund.fundTxIn fund))
-
--- | Render a list of funds as comma-separated @\"\<txid\>#\<ix\>\"@ references.
-renderFundTxIns :: [Fund.Fund] -> Text.Text
-renderFundTxIns = Text.intercalate "," . map (Api.renderTxIn . Fund.fundTxIn)
-
 --------------------------------------------------------------------------------
 -- Pipe trace rendering
 --------------------------------------------------------------------------------
 
--- | Namespaces: @TxCentrifuge.Pipe.{InputsEnqueued, InputsDequeued,
--- PayloadEnqueued, PayloadDequeued}@. Outer prefix
--- @[\"TxCentrifuge\", \"Pipe\"]@ is set in 'setupTracers'.
+-- | Namespaces: @TxCentrifuge.Pipe.Inputs.{Enqueued, Dequeued}@ and
+-- @TxCentrifuge.Pipe.Payload.{Enqueued, Dequeued}@. Outer prefix
+-- @[\"TxCentrifuge\", \"Pipe\"]@ is set in 'setupTracers'. Grouped by queue so
+-- that the input events, which the startup load makes one of per fund, can be
+-- configured apart from the payload ones.
 instance Logging.MetaTrace PipeTrace where
-  namespaceFor PipeInputsEnqueued{}  = Logging.Namespace [] ["InputsEnqueued"]
-  namespaceFor PipeInputsDequeued{}  = Logging.Namespace [] ["InputsDequeued"]
-  namespaceFor PipePayloadEnqueued{} = Logging.Namespace [] ["PayloadEnqueued"]
-  namespaceFor PipePayloadDequeued{} = Logging.Namespace [] ["PayloadDequeued"]
-  severityFor (Logging.Namespace _ ["InputsEnqueued"])  _ = Just Logging.Info
-  severityFor (Logging.Namespace _ ["InputsDequeued"])  _ = Just Logging.Info
-  severityFor (Logging.Namespace _ ["PayloadEnqueued"]) _ = Just Logging.Info
-  severityFor (Logging.Namespace _ ["PayloadDequeued"]) _ = Just Logging.Info
+  namespaceFor PipeInputsEnqueued{}  = Logging.Namespace [] ["Inputs","Enqueued"]
+  namespaceFor PipeInputsDequeued{}  = Logging.Namespace [] ["Inputs","Dequeued"]
+  namespaceFor PipePayloadEnqueued{} = Logging.Namespace [] ["Payload","Enqueued"]
+  namespaceFor PipePayloadDequeued{} = Logging.Namespace [] ["Payload","Dequeued"]
+  severityFor (Logging.Namespace _ ["Inputs","Enqueued"])  _ = Just Logging.Info
+  severityFor (Logging.Namespace _ ["Inputs","Dequeued"])  _ = Just Logging.Info
+  severityFor (Logging.Namespace _ ["Payload","Enqueued"]) _ = Just Logging.Info
+  severityFor (Logging.Namespace _ ["Payload","Dequeued"]) _ = Just Logging.Info
   severityFor _ _ = Nothing
-  documentFor (Logging.Namespace _ ["InputsEnqueued"]) = Just
-    "Inputs were added to the input queue (count at DDetailed, data at DMaximum)."
-  documentFor (Logging.Namespace _ ["InputsDequeued"]) = Just
-    "Inputs were removed from the input queue for the builder (count at DDetailed, data at DMaximum)."
-  documentFor (Logging.Namespace _ ["PayloadEnqueued"]) = Just
-    "A payload was added to the payload queue (its txId is included at DMaximum)."
-  documentFor (Logging.Namespace _ ["PayloadDequeued"]) = Just
-    "A payload was removed from the payload queue for a worker (txId at DMaximum)."
+  documentFor (Logging.Namespace _ ["Inputs","Enqueued"]) = Just
+    "Inputs were added to the input queue (count from DNormal, the funds from DDetailed)."
+  documentFor (Logging.Namespace _ ["Inputs","Dequeued"]) = Just
+    "Inputs were removed from the input queue for the builder (count from DNormal, the funds from DDetailed)."
+  documentFor (Logging.Namespace _ ["Payload","Enqueued"]) = Just
+    "A payload was added to the payload queue (its key from DDetailed)."
+  documentFor (Logging.Namespace _ ["Payload","Dequeued"]) = Just
+    "A payload was removed from the payload queue for a worker (its key from DDetailed)."
   documentFor _ = Nothing
   allNamespaces =
-    [ Logging.Namespace [] ["InputsEnqueued"]
-    , Logging.Namespace [] ["InputsDequeued"]
-    , Logging.Namespace [] ["PayloadEnqueued"]
-    , Logging.Namespace [] ["PayloadDequeued"]
+    [ Logging.Namespace [] ["Inputs","Enqueued"]
+    , Logging.Namespace [] ["Inputs","Dequeued"]
+    , Logging.Namespace [] ["Payload","Enqueued"]
+    , Logging.Namespace [] ["Payload","Dequeued"]
     ]
 
--- | Machine format: every Pipe event always carries @pipe@ + @depth@ (the
--- namespace already says which queue). Input events add @count@ at
--- 'Logging.DDetailed' and above and an @inputs@ array of rendered funds at
--- 'Logging.DMaximum' (see 'renderFund'). Payload events add the payload's key
--- at 'Logging.DMaximum' (see 'renderTxKey' for the fields it lands in). Human
--- format shows just the depth (and, for inputs, the count).
+-- | Machine format: every Pipe event carries @pipe@ at every level and
+-- @depth@ from 'Logging.DNormal' (the namespace already says which queue).
+-- Input events add @count@ from 'Logging.DNormal' too, and an @inputs@ array
+-- from 'Logging.DDetailed', its funds
+-- as references there and as objects at 'Logging.DMaximum' (see 'renderFund').
+-- Payload events add the payload's key from 'Logging.DDetailed', the level at
+-- which the input events name their funds (see 'renderTxKey' for the fields it
+-- lands in). Human format shows just the depth (and, for inputs, the count).
 instance Logging.LogFormatting PipeTrace where
   forMachine dtal (PipeInputsEnqueued name depth inputs) = mconcat $
-       [ "pipe"  .= name
-       , "depth" .= depth
+       [ "pipe"  .= name ]
+    ++ [ "depth" .= depth
+       | dtal >= Logging.DNormal
        ]
     ++ [ "count"  .= length inputs
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DNormal
        ]
     ++ [ "inputs" .= map (renderFund dtal) inputs
-       | dtal >= Logging.DMaximum
+       | dtal >= Logging.DDetailed
        ]
   forMachine dtal (PipeInputsDequeued name depth inputs) = mconcat $
-       [ "pipe"  .= name
-       , "depth" .= depth
+       [ "pipe"  .= name ]
+    ++ [ "depth" .= depth
+       | dtal >= Logging.DNormal
        ]
     ++ [ "count"  .= length inputs
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DNormal
        ]
     ++ [ "inputs" .= map (renderFund dtal) inputs
-       | dtal >= Logging.DMaximum
+       | dtal >= Logging.DDetailed
        ]
   forMachine dtal (PipePayloadEnqueued name depth txKey) = mconcat $
-       [ "pipe"  .= name
-       , "depth" .= depth
+       [ "pipe"  .= name ]
+    ++ [ "depth" .= depth
+       | dtal >= Logging.DNormal
        ]
     ++ [ renderTxKey txKey
-       | dtal >= Logging.DMaximum
+       | dtal >= Logging.DDetailed
        ]
   forMachine dtal (PipePayloadDequeued name depth txKey) = mconcat $
-       [ "pipe"  .= name
-       , "depth" .= depth
+       [ "pipe"  .= name ]
+    ++ [ "depth" .= depth
+       | dtal >= Logging.DNormal
        ]
     ++ [ renderTxKey txKey
-       | dtal >= Logging.DMaximum
+       | dtal >= Logging.DDetailed
        ]
   forHuman (PipeInputsEnqueued name depth inputs) =
        "InputsEnqueued [" <> Text.pack name <> "]"
@@ -472,82 +584,94 @@ instance Logging.MetaTrace RecyclerTrace where
     , Logging.Namespace [] ["Reset"]
     ]
 
--- | Machine format: every event emits @recycler@ and @backlog@ (the
--- resulting backlog size, not a queue depth). 'RecyclerAddToBacklog'
--- carries the added entry: @consumed_count@ and @outputs_count@ at
--- 'Logging.DDetailed', the payload's key (see 'renderTxKey') and the
--- @consumed@ and
--- @outputs@ fund arrays (see 'renderFund') at 'Logging.DMaximum'.
--- 'RecyclerAddToPipe' (which also emits @pipe@) adds a @count@ at
--- 'Logging.DDetailed' and an @inputs@ array of the recycled funds at
--- 'Logging.DMaximum'. 'RecyclerReset' (also with @pipe@) adds @count@ for
--- the fresh inputs, @dropped_inputs_count@ and @dropped_payloads_count@ at
--- 'Logging.DDetailed', plus the @inputs@ (fresh), @dropped_inputs@ and
--- @dropped_payloads@ (payload keys as hex) arrays at 'Logging.DMaximum'.
+-- | Machine format: every event emits @recycler@ at every level and @backlog@
+-- (the resulting backlog size, not a queue depth) from 'Logging.DNormal', then
+-- the same ladder as everywhere else: counts from 'Logging.DNormal', arrays
+-- from 'Logging.DDetailed' with their
+-- funds as references there and as objects at 'Logging.DMaximum' (see
+-- 'renderFund'), payload keys from 'Logging.DDetailed' (see 'renderTxKey').
+--
+-- * 'RecyclerAddToBacklog': @consumed_count@ and @outputs_count@, then the
+--   @consumed@ and @outputs@ arrays, then the held payload's key.
+-- * 'RecyclerAddToPipe' (also @pipe@): @count@, then the @inputs@ array, then
+--   the released payload's key.
+-- * 'RecyclerReset' (also @pipe@): @fresh_count@, @dropped_inputs_count@ and
+--   @dropped_payloads_count@, then the @fresh@, @dropped_inputs@ and
+--   @dropped_payloads@ arrays, the last being payload keys as hex.
+--
 -- Human format shows the backlog size and the counts.
 instance Logging.LogFormatting RecyclerTrace where
   forMachine dtal (RecyclerAddToBacklog recyclerName backlog txKey consumed outputs) =
     mconcat $
-       [ "recycler" .= recyclerName
-       , "backlog"  .= backlog
+       [ "recycler" .= recyclerName ]
+    ++ [ "backlog"  .= backlog
+       | dtal >= Logging.DNormal
        ]
     ++ [ "consumed_count" .= length consumed
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DNormal
        ]
     ++ [ "outputs_count" .= length outputs
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DNormal
        ]
     ++ [ renderTxKey txKey
-       | dtal >= Logging.DMaximum
+       | dtal >= Logging.DDetailed
        ]
     ++ [ "consumed" .= map (renderFund dtal) consumed
-       | dtal >= Logging.DMaximum
+       | dtal >= Logging.DDetailed
        ]
     ++ [ "outputs" .= map (renderFund dtal) outputs
-       | dtal >= Logging.DMaximum
+       | dtal >= Logging.DDetailed
        ]
-  forMachine dtal (RecyclerAddToPipe recyclerName pipeName backlog inputs) = mconcat $
+  forMachine dtal (RecyclerAddToPipe recyclerName pipeName backlog txKey inputs) =
+    mconcat $
        [ "recycler" .= recyclerName
        , "pipe"     .= pipeName
-       , "backlog"  .= backlog
+       ]
+    ++ [ "backlog"  .= backlog
+       | dtal >= Logging.DNormal
        ]
     ++ [ "count"  .= length inputs
+       | dtal >= Logging.DNormal
+       ]
+    ++ [ renderTxKey txKey
        | dtal >= Logging.DDetailed
        ]
     ++ [ "inputs" .= map (renderFund dtal) inputs
-       | dtal >= Logging.DMaximum
+       | dtal >= Logging.DDetailed
        ]
   forMachine dtal (RecyclerReset recyclerName pipeName backlog droppedPayloads droppedInputs fresh) =
     mconcat $
        [ "recycler" .= recyclerName
        , "pipe"     .= pipeName
-       , "backlog"  .= backlog
        ]
-    ++ [ "count" .= length fresh
-       | dtal >= Logging.DDetailed
+    ++ [ "backlog"  .= backlog
+       | dtal >= Logging.DNormal
+       ]
+    ++ [ "fresh_count" .= length fresh
+       | dtal >= Logging.DNormal
        ]
     ++ [ "dropped_inputs_count" .= length droppedInputs
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DNormal
        ]
     ++ [ "dropped_payloads_count" .= length droppedPayloads
+       | dtal >= Logging.DNormal
+       ]
+    ++ [ "fresh" .= map (renderFund dtal) fresh
        | dtal >= Logging.DDetailed
        ]
-    ++ [ "inputs" .= map (renderFund dtal) fresh
-       | dtal >= Logging.DMaximum
-       ]
     ++ [ "dropped_inputs" .= map (renderFund dtal) droppedInputs
-       | dtal >= Logging.DMaximum
+       | dtal >= Logging.DDetailed
        ]
     ++ [ "dropped_payloads" .=
            map (String . Hash.hashToTextAsHex . Chain.txKeyHash) droppedPayloads
-       | dtal >= Logging.DMaximum
+       | dtal >= Logging.DDetailed
        ]
   forHuman (RecyclerAddToBacklog recyclerName backlog _txKey consumed outputs) =
        "AddToBacklog [" <> Text.pack recyclerName <> "]"
     <> " backlog=" <> Text.pack (show backlog)
     <> " consumed_count=" <> Text.pack (show (length consumed))
     <> " outputs_count=" <> Text.pack (show (length outputs))
-  forHuman (RecyclerAddToPipe recyclerName pipeName backlog inputs) =
+  forHuman (RecyclerAddToPipe recyclerName pipeName backlog _txKey inputs) =
        "AddToPipe [" <> Text.pack recyclerName <> "]"
     <> " pipe=" <> Text.pack pipeName
     <> " backlog=" <> Text.pack (show backlog)
@@ -556,7 +680,7 @@ instance Logging.LogFormatting RecyclerTrace where
        "Reset [" <> Text.pack recyclerName <> "]"
     <> " pipe=" <> Text.pack pipeName
     <> " backlog=" <> Text.pack (show backlog)
-    <> " count=" <> Text.pack (show (length fresh))
+    <> " fresh_count=" <> Text.pack (show (length fresh))
     <> " dropped_inputs_count=" <> Text.pack (show (length droppedInputs))
     <> " dropped_payloads_count=" <> Text.pack (show (length droppedPayloads))
 
@@ -564,29 +688,59 @@ instance Logging.LogFormatting RecyclerTrace where
 -- Observer trace rendering
 --------------------------------------------------------------------------------
 
--- | Namespace: @TxCentrifuge.Observer.Announce@. Outer prefix
--- @[\"TxCentrifuge\", \"Observer\"]@ is set in 'setupTracers'.
+-- | Namespaces: @TxCentrifuge.Observer.Announce.{Confirmed, Orphaned}@. Outer
+-- prefix @[\"TxCentrifuge\", \"Observer\"]@ is set in 'setupTracers'. Two
+-- namespaces so the flood (one confirmation per chain transaction per
+-- observer) can be silenced while the rare orphan is kept.
 instance Logging.MetaTrace ObserverTrace where
-  namespaceFor ObserverAnnounce{} = Logging.Namespace [] ["Announce"]
-  severityFor (Logging.Namespace _ ["Announce"]) _ = Just Logging.Info
+  namespaceFor ObserverConfirmed{} = Logging.Namespace [] ["Announce","Confirmed"]
+  namespaceFor ObserverOrphaned{}  = Logging.Namespace [] ["Announce","Orphaned"]
+  severityFor (Logging.Namespace _ ["Announce","Confirmed"]) _ = Just Logging.Info
+  severityFor (Logging.Namespace _ ["Announce","Orphaned"])  _ = Just Logging.Warning
   severityFor _ _ = Nothing
-  documentFor (Logging.Namespace _ ["Announce"]) = Just
-    "The observer saw a transaction confirmed or orphaned (rolled back)."
+  documentFor (Logging.Namespace _ ["Announce","Confirmed"]) = Just
+    "The observer saw a transaction confirmed."
+  documentFor (Logging.Namespace _ ["Announce","Orphaned"]) = Just
+    "The observer saw a transaction orphaned: it was in a block that was rolled back and did not reappear within the confirmation window."
   documentFor _ = Nothing
   allNamespaces =
-    [ Logging.Namespace [] ["Announce"]
+    [ Logging.Namespace [] ["Announce","Confirmed"]
+    , Logging.Namespace [] ["Announce","Orphaned"]
     ]
 
 instance Logging.LogFormatting ObserverTrace where
-  forMachine _ (ObserverAnnounce observer txKey isOrphan) = mconcat
-    [ "observer" .= observer
-    , renderTxKey txKey
-    , "isOrphan" .= isOrphan
-    ]
-  forHuman (ObserverAnnounce observer txKey isOrphan) =
-       "Announce [" <> Text.pack observer <> "]"
+  forMachine dtal (ObserverConfirmed observer txKey blockNo slotNo) = mconcat $
+       [ "observer" .= observer ]
+    ++ [ renderTxKey txKey
+       | dtal >= Logging.DNormal
+       ]
+    ++ [ "blockNo" .= blockNo
+       | dtal >= Logging.DDetailed
+       ]
+    ++ [ "slotNo"  .= slotNo
+       | dtal >= Logging.DDetailed
+       ]
+  forMachine dtal (ObserverOrphaned observer txKey blockNo slotNo) = mconcat $
+       [ "observer" .= observer ]
+    ++ [ renderTxKey txKey
+       | dtal >= Logging.DNormal
+       ]
+    ++ [ "blockNo" .= blockNo
+       | dtal >= Logging.DDetailed
+       ]
+    ++ [ "slotNo"  .= slotNo
+       | dtal >= Logging.DDetailed
+       ]
+  forHuman (ObserverConfirmed observer txKey blockNo slotNo) =
+       "Confirmed [" <> Text.pack observer <> "]"
     <> " txHash=" <> Hash.hashToTextAsHex (Chain.txKeyHash txKey)
-    <> (if isOrphan then " (orphan)" else " (confirmed)")
+    <> " blockNo=" <> Text.pack (show blockNo)
+    <> " slotNo=" <> Text.pack (show slotNo)
+  forHuman (ObserverOrphaned observer txKey blockNo slotNo) =
+       "Orphaned [" <> Text.pack observer <> "]"
+    <> " txHash=" <> Hash.hashToTextAsHex (Chain.txKeyHash txKey)
+    <> " blockNo=" <> Text.pack (show blockNo)
+    <> " slotNo=" <> Text.pack (show slotNo)
 
 --------------------------------------------------------------------------------
 -- TxSubmission trace rendering
@@ -605,13 +759,13 @@ instance Logging.MetaTrace TxSubmission where
   severityFor (Logging.Namespace _ ["ReplyTxs"])     _ = Just Logging.Info
   severityFor _ _ = Nothing
   documentFor (Logging.Namespace _ ["RequestTxIds"]) = Just
-    "Node requested tx id announcements (blocking or non-blocking)."
+    "Node requested tx id announcements (blocking or non-blocking). ACK and REQ from DNormal, the unacked ids at DMaximum."
   documentFor (Logging.Namespace _ ["ReplyTxIds"]) = Just
-    "We replied with tx id announcements and sizes."
+    "We replied with tx id announcements and sizes. The answered request's ACK and REQ from DNormal, the announced pairs from DDetailed, the unacked ids at DMaximum."
   documentFor (Logging.Namespace _ ["RequestTxs"]) = Just
-    "Node requested full transactions by TxId."
+    "Node requested full transactions by TxId. The requested ids at DMaximum."
   documentFor (Logging.Namespace _ ["ReplyTxs"]) = Just
-    "We sent the requested transactions."
+    "We sent the requested transactions. The sent pairs from DDetailed, the requested ids at DMaximum."
   documentFor _ = Nothing
   allNamespaces =
     [ Logging.Namespace [] ["RequestTxIds"]
@@ -620,43 +774,57 @@ instance Logging.MetaTrace TxSubmission where
     , Logging.Namespace [] ["ReplyTxs"]
     ]
 
--- | Machine-readable and human-readable rendering. All TxId lists are omitted
--- below 'Logging.DDetailed' to avoid the cost of hex-encoding every transaction
--- identifier on every protocol round-trip.
+-- | Machine-readable and human-readable rendering. The bare identifier lists
+-- are omitted below 'Logging.DMaximum': hex-encoding every identifier on every
+-- protocol round-trip is what costs here, and the sizes a report needs come
+-- with the @txs@ pairs one level down.
 --
--- Machine format ('Logging.DNormal'):
+-- Machine format ('Logging.DMinimal'): the target alone, for all four.
+--
+-- Machine format ('Logging.DNormal'): adds the ACK and REQ counts, which only
+-- the TxId messages carry. On 'ReplyTxIds' they are not new numbers: they are
+-- the ACK and REQ of the @MsgRequestTxIds@ this reply answers, echoed, so REQ
+-- against the @txs@ count below is the demand this round-trip did not meet.
 --
 -- @
 -- { \"target\": \"n\", \"ack\": 0, \"req\": 3 }
--- { \"target\": \"n\" }
+-- { \"target\": \"n\", \"ack\": 0, \"req\": 3 }
 -- { \"target\": \"n\" }
 -- { \"target\": \"n\" }
 -- @
 --
--- Machine format ('Logging.DDetailed' and above):
+-- Machine format ('Logging.DDetailed'): adds what we announced or sent, with
+-- the sizes, so 'ReplyTxIds' and 'ReplyTxs' only.
 --
 -- @
--- { \"target\": \"n\", \"ack\": 0, \"req\": 3, \"unacked\": [\"ab..\"] }
--- { \"target\": \"n\", \"ack\": 0, \"req\": 3, \"txs\": [{\"id\":\"ab..\",\"size\":9}], \"unacked\": [\"ab..\"] }
--- { \"target\": \"n\", \"txIds\": [\"ab..\"] }
--- { \"target\": \"n\", \"txs\": [{\"id\":\"ab..\",\"size\":9}], \"requested\": [\"ab..\"] }
+-- { .., \"txs\": [{\"id\":\"ab..\",\"size\":9}] }
+-- @
+--
+-- Machine format ('Logging.DMaximum'): adds the identifier lists, @unacked@ on
+-- both TxId messages, @txIds@ on 'RequestTxs' and @requested@ on 'ReplyTxs'.
+--
+-- @
+-- { .., \"unacked\": [\"ab..\"] }
 -- @
 instance Logging.LogFormatting TxSubmission where
   forMachine dtal (RequestTxIds target unacked ack req) = mconcat $
-       [ "target"    .= target
-       , "ack"       .= ack
-       , "req"       .= req
+       [ "target"    .= target ]
+    ++ [ "ack"       .= ack
+       | dtal >= Logging.DNormal
+       ]
+    ++ [ "req"       .= req
+       | dtal >= Logging.DNormal
        ]
     ++ [ "unacked"   .= map Api.serialiseToRawBytesHexText unacked
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DMaximum
        ]
   forMachine dtal (ReplyTxIds target ack req unacked announced) = mconcat $
        [ "target"    .= target ]
     ++ [ "ack"       .= ack
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DNormal
        ]
     ++ [ "req"       .= req
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DNormal
        ]
     ++ [ "txs"       .= map
                           (\(txId,txSize) ->
@@ -669,12 +837,12 @@ instance Logging.LogFormatting TxSubmission where
        | dtal >= Logging.DDetailed
        ]
     ++ [ "unacked"   .= map Api.serialiseToRawBytesHexText unacked
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DMaximum
        ]
   forMachine dtal (RequestTxs target txIds) = mconcat $
        [ "target"    .= target ]
     ++ [ "txIds"     .= map Api.serialiseToRawBytesHexText txIds
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DMaximum
        ]
   forMachine dtal (ReplyTxs target requested sent) = mconcat $
        [ "target"    .= target ]
@@ -689,7 +857,7 @@ instance Logging.LogFormatting TxSubmission where
        | dtal >= Logging.DDetailed
        ]
     ++ [ "requested" .= map Api.serialiseToRawBytesHexText requested
-       | dtal >= Logging.DDetailed
+       | dtal >= Logging.DMaximum
        ]
   forHuman (RequestTxIds target _unacked ack req) =
        "RequestTxIds [" <> Text.pack target <> "]"

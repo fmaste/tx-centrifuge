@@ -130,7 +130,7 @@ resolveConfig path inputs = do
     -- mkRecyclerHandle: no-op recycle handler.
     (\_ _ _ -> pure Runtime.RecyclerHandle
       { Runtime.rhOnAddToBacklog = \_ _ _ _ -> pure ()
-      , Runtime.rhOnAddToPipe    = \_ _ -> pure ()
+      , Runtime.rhOnAddToPipe    = \_ _ _ -> pure ()
       , Runtime.rhOnReset        = \_ _ _ _ -> pure ()
       , Runtime.rhRecover        = Nothing
       })

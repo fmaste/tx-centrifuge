@@ -199,9 +199,10 @@ data RecyclerHandle key input payload = RecyclerHandle
     -- produced outputs) and the resulting backlog size each time it adds a
     -- payload to the backlog.
     rhOnAddToBacklog :: !(Recycler.OnAddToBacklogEvent key input)
-    -- | Fired by the recycler with the inputs it adds to the pipe and the
-    -- resulting backlog size, each recycle.
-  , rhOnAddToPipe    :: !(Recycler.OnAddToPipeEvent input)
+    -- | Fired by the recycler with the released payload's key, the inputs it
+    -- adds to the pipe and the resulting backlog size, each recycle. The key
+    -- pairs with 'rhOnAddToBacklog', so the wait is the time between the two.
+  , rhOnAddToPipe    :: !(Recycler.OnAddToPipeEvent key input)
     -- | Fired with the dropped inputs, the dropped payloads, the fresh inputs
     -- and the resulting backlog size each time a reset drops the queued inputs
     -- and payloads and reseeds the input queue.

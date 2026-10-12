@@ -125,10 +125,14 @@ type OnAddToBacklogEvent key input =
   key -> [input] -> [input] -> Natural -> IO ()
 
 -- | Handler fired by the recycle worker each time it adds recycled inputs to
--- the pipe's input queue, with those inputs and the resulting backlog size
--- (e.g. for tracing).
+-- the pipe's input queue, with the key of the payload being released, those
+-- inputs and the resulting backlog size (e.g. for tracing).
+--
+-- The key is the same one 'OnAddToBacklogEvent' carried when the payload was
+-- held, so the two events pair up: how long a payload waited is the time
+-- between them.
 -- Created by the caller and passed to 'mkRecycler', mirrors 'Pipe' events.
-type OnAddToPipeEvent input = [input] -> Natural -> IO ()
+type OnAddToPipeEvent key input = key -> [input] -> Natural -> IO ()
 
 -- | Handler fired by the recycle worker each time a reset drops the queued
 -- inputs and payloads and reseeds the input queue, with the dropped inputs, the
@@ -151,9 +155,10 @@ data Recycler key input payload = Recycler
     -- with the key, the consumed inputs, the produced outputs and the
     -- resulting backlog size (e.g. for tracing).
   , recyclerOnAddToBacklog :: !(OnAddToBacklogEvent key input)
-    -- | Fired by the worker with the inputs it adds to the pipe and the
-    -- resulting backlog size, each time it recycles (e.g. for tracing).
-  , recyclerOnAddToPipe    :: !(OnAddToPipeEvent input)
+    -- | Fired by the worker with the released payload's key, the inputs it
+    -- adds to the pipe and the resulting backlog size, each time it recycles
+    -- (e.g. for tracing).
+  , recyclerOnAddToPipe    :: !(OnAddToPipeEvent key input)
     -- | Fired by the worker with the dropped inputs, the dropped payloads, the
     -- fresh inputs and the resulting backlog size, each time a reset drops the
     -- queued inputs and payloads and reseeds the input queue (e.g. for
@@ -175,9 +180,9 @@ mkRecycler
   -- | Fired with the added entry (key, consumed inputs, produced outputs) and
   -- the resulting backlog size each time a payload enters the backlog.
   -> OnAddToBacklogEvent key input
-  -- | Fired with the inputs and backlog size each time the worker adds recycled
-  -- inputs to the pipe.
-  -> OnAddToPipeEvent input
+  -- | Fired with the released payload's key, the inputs and the backlog size
+  -- each time the worker adds recycled inputs to the pipe.
+  -> OnAddToPipeEvent key input
   -- | Fired with the dropped inputs, the dropped payloads, the fresh inputs and
   -- the resulting backlog size each time a reset drops the queued inputs and
   -- payloads and reseeds the input queue.
@@ -233,9 +238,10 @@ runRecycler recycler name = Async.async $ do
       recycle key inputs backlog = do
         let backlog' = Map.delete key backlog
         Pipe.addInputs (recyclerPipe recycler) inputs
-        -- Caller event: AddToPipe. Fired after the fact with the inputs and the
-        -- resulting backlog size, either way (an empty recycle is traced too).
-        (recyclerOnAddToPipe recycler) inputs (depthOf backlog')
+        -- Caller event: AddToPipe. Fired after the fact with the key, the
+        -- inputs and the resulting backlog size, either way (an empty recycle
+        -- is traced too).
+        (recyclerOnAddToPipe recycler) key inputs (depthOf backlog')
         pure backlog'
       go backlog = do
         event <- STM.atomically $ do

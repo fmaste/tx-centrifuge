@@ -269,12 +269,12 @@ main = do
           , Runtime.phOnInputsDequeued = \inputs depth ->
               Tracing.traceWith (Tracing.trPipe tracers)
                 (Tracing.PipeInputsDequeued inputQueueName depth inputs)
-          , Runtime.phOnPayloadEnqueued = \key depth ->
+          , Runtime.phOnPayloadEnqueued = \txKey depth ->
               Tracing.traceWith (Tracing.trPipe tracers)
-                (Tracing.PipePayloadEnqueued builderName depth key)
-          , Runtime.phOnPayloadDequeued = \key depth ->
+                (Tracing.PipePayloadEnqueued builderName depth txKey)
+          , Runtime.phOnPayloadDequeued = \txKey depth ->
               Tracing.traceWith (Tracing.trPipe tracers)
-                (Tracing.PipePayloadDequeued builderName depth key)
+                (Tracing.PipePayloadDequeued builderName depth txKey)
           }
 
   -- Recovery factory used by 'mkRecyclerHandle'. When the workload's builder
@@ -358,14 +358,14 @@ main = do
   let mkRecyclerHandle recyclerIndex builderName inputQueueName = do
         recover <- mkRecover recyclerIndex builderName
         pure Runtime.RecyclerHandle
-          { Runtime.rhOnAddToBacklog = \key consumed outputs backlog ->
+          { Runtime.rhOnAddToBacklog = \txKey consumed outputs backlog ->
               Tracing.traceWith (Tracing.trRecycler tracers)
                 (Tracing.RecyclerAddToBacklog
-                  builderName backlog key consumed outputs)
-          , Runtime.rhOnAddToPipe = \inputs backlog ->
+                  builderName backlog txKey consumed outputs)
+          , Runtime.rhOnAddToPipe = \txKey inputs backlog ->
               Tracing.traceWith (Tracing.trRecycler tracers)
                 (Tracing.RecyclerAddToPipe
-                  builderName inputQueueName backlog inputs
+                  builderName inputQueueName backlog txKey inputs
                 )
             -- The trace keeps the dropped payloads by key, not the full
             -- transactions.
@@ -388,8 +388,9 @@ main = do
           Left err -> die $ "Observer " ++ observerName ++ ": " ++ err
           Right o  -> pure o
         -- Observer announce loop: dup the confirmation broadcast and log every
-        -- confirmed/orphaned tx (TxCentrifuge.Observer.Announce), decoupled from
-        -- the pipe and recycling. Runs alongside the connection in 'ohRun'.
+        -- confirmed/orphaned tx (TxCentrifuge.Observer.Announce.{Confirmed,
+        -- Orphaned}), decoupled from the pipe and recycling. Runs alongside the
+        -- connection in 'ohRun'.
         -- TODO: this is all-chain — it logs every confirmed tx the observer sees
         -- on the chain, not just this generator's transactions (the broadcast is
         -- unfiltered). Filter to our own txIds once Main tracks its in-flight set.
@@ -397,11 +398,18 @@ main = do
               chan <- STM.atomically $ STM.dupTChan broadcast
               forever $ do
                 eitherBlockTx <- STM.atomically $ STM.readTChan chan
-                let (isOrphan, txKey) = case eitherBlockTx of
-                      Left  blockTx -> (True,  Chain.blockTxKey blockTx)
-                      Right blockTx -> (False, Chain.blockTxKey blockTx)
-                Tracing.traceWith (Tracing.trObserver tracers)
-                  (Tracing.ObserverAnnounce observerName txKey isOrphan)
+                -- The broadcast says which: 'Left' orphaned, 'Right'
+                -- confirmed, and each is its own namespace.
+                Tracing.traceWith (Tracing.trObserver tracers) $
+                  case eitherBlockTx of
+                    Left  blockTx -> Tracing.ObserverOrphaned  observerName
+                                       (Chain.blockTxKey     blockTx)
+                                       (Chain.blockTxBlockNo blockTx)
+                                       (Chain.blockTxSlotNo  blockTx)
+                    Right blockTx -> Tracing.ObserverConfirmed observerName
+                                       (Chain.blockTxKey     blockTx)
+                                       (Chain.blockTxBlockNo blockTx)
+                                       (Chain.blockTxSlotNo  blockTx)
         case observer of
           -- N2N: ChainSync (headers) + BlockFetch (blocks) + KeepAlive.
           --------------------------------------------------------------
