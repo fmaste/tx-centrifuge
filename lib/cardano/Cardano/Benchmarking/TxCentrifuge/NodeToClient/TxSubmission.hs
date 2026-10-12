@@ -46,7 +46,8 @@ import Ouroboros.Network.Protocol.LocalTxSubmission.Client qualified as LTxSub
 -------------------
 -- tx-centrifuge --
 -------------------
-import Cardano.Benchmarking.TxCentrifuge.Block qualified as Block
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
+import Cardano.Benchmarking.TxCentrifuge.Era (Era)
 
 --------------------------------------------------------------------------------
 -- Client type.
@@ -60,8 +61,8 @@ import Cardano.Benchmarking.TxCentrifuge.Block qualified as Block
 -- replying.
 type TxSubmissionClient =
   LTxSub.LocalTxSubmissionClient
-    (Mempool.GenTx Block.CardanoBlock)
-    (Mempool.ApplyTxErr Block.CardanoBlock)
+    (Mempool.GenTx Chain.CardanoBlock)
+    (Mempool.ApplyTxErr Chain.CardanoBlock)
     IO
     ()
 
@@ -76,38 +77,38 @@ type TxSubmissionClient =
 --
 -- 1. Call @blockingFetch@ to obtain the next transaction (may block).
 -- 2. Submit the transaction to the local node.
--- 3. Call @onResult@ with the 'Api.TxId' and the submit result
+-- 3. Call @onResult@ with the 'Chain.TxId' and the submit result
 --    ('SubmitSuccess' or @'SubmitFail' reason@ with a @show@-ed rejection).
 -- 4. Repeat from (1).
 txSubmissionClient
   :: String
   -- ^ Target name (for identification in callbacks).
-  -> IO (Api.Tx Api.ConwayEra)
+  -> IO (Api.Tx Era)
   -- ^ Blocking fetch: wait for the next transaction to submit.
-  -> (Api.TxId -> SubmitResult String -> IO ())
+  -> (Chain.TxId -> SubmitResult String -> IO ())
   -- ^ Callback after each submission. The rejection reason (if any) is
-  --   stringified via 'show' on @'Mempool.ApplyTxErr' Block.CardanoBlock@.
+  --   stringified via 'show' on @'Mempool.ApplyTxErr' Chain.CardanoBlock@.
   -> TxSubmissionClient
 txSubmissionClient _targetName blockingFetch onResult =
   LTxSub.LocalTxSubmissionClient nextTx
   where
     nextTx :: IO
       ( LTxSub.LocalTxClientStIdle
-          (Mempool.GenTx Block.CardanoBlock)
-          (Mempool.ApplyTxErr Block.CardanoBlock)
+          (Mempool.GenTx Chain.CardanoBlock)
+          (Mempool.ApplyTxErr Chain.CardanoBlock)
           IO
           ()
       )
     nextTx = do
       tx <- blockingFetch
-      let !genTx = Block.toGenTx tx
+      let !genTx = Chain.toGenTx tx
           !txId  = Api.getTxId (Api.getTxBody tx)
       pure $ LTxSub.SendMsgSubmitTx genTx $ \result -> do
         onResult txId (mapResult result)
         nextTx
 
     mapResult
-      :: SubmitResult (Mempool.ApplyTxErr Block.CardanoBlock)
+      :: SubmitResult (Mempool.ApplyTxErr Chain.CardanoBlock)
       -> SubmitResult String
     mapResult SubmitSuccess    = SubmitSuccess
     mapResult (SubmitFail err) = SubmitFail (show err)

@@ -43,11 +43,15 @@ import Control.Exception (SomeException, try)
 -----------
 -- aeson --
 -----------
-import Data.Aeson (Value (String), (.=), object)
+import Data.Aeson (Object, Value (String), (.=), object)
 -----------------
 -- cardano-api --
 -----------------
 import Cardano.Api qualified as Api
+--------------------------
+-- cardano-crypto-class --
+--------------------------
+import Cardano.Crypto.Hash qualified as Hash
 ----------------
 -- containers --
 ----------------
@@ -106,6 +110,7 @@ import Network.TypedProtocol.Codec (AnyMessage (AnyMessageAndAgency))
 -------------------
 -- tx-centrifuge --
 -------------------
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
 import Cardano.Benchmarking.TxCentrifuge.Fund qualified as Fund
 -- Unqualified: the instances below read as if the events were declared here.
 import Cardano.Benchmarking.TxCentrifuge.Tracing
@@ -244,11 +249,14 @@ instance Logging.MetaTrace BuilderTrace where
 -- | Machine-readable ('forMachine') and human-readable ('forHuman') rendering
 -- of 'BuilderTrace' messages.
 --
--- Machine format ('Logging.DNormal'):
+-- Machine format ('Logging.DNormal'): both of the transaction's names, the
+-- @txId@ that a ranking block's body gives it and the @txHash@ that an
+-- endorser block lists it under.
 --
 -- @
 -- { \"builder\": \"workload-name\"
 -- , \"txId\": \"\<64-char hex\>\"
+-- , \"txHash\": \"\<64-char hex\>\"
 -- }
 -- @
 --
@@ -258,6 +266,7 @@ instance Logging.MetaTrace BuilderTrace where
 -- @
 -- { \"builder\": \"workload-name\"
 -- , \"txId\": \"\<64-char hex\>\"
+-- , \"txHash\": \"\<64-char hex\>\"
 -- , \"inputs\": [\"\<txid\>#\<ix\>\", ...]
 -- , \"outputs\": [\"\<txid\>#\<ix\>\", ...]
 -- }
@@ -271,6 +280,7 @@ instance Logging.MetaTrace BuilderTrace where
 -- @
 -- { \"builder\": \"workload-name\"
 -- , \"txId\": \"\<64-char hex\>\"
+-- , \"txHash\": \"\<64-char hex\>\"
 -- , \"destinations\": [\"addr...\", ...]
 -- , \"inputs\": [{\"utxo\": \"\<txid\>#\<ix\>\", \"lovelace\": 1000000}, ...]
 -- , \"outputs\": [{\"utxo\": \"\<txid\>#\<ix\>\", \"lovelace\": 500000}, ...]
@@ -283,9 +293,9 @@ instance Logging.MetaTrace BuilderTrace where
 -- NewTx [workload-name] \<txid\> inputs=[...] outputs=[...]
 -- @
 instance Logging.LogFormatting BuilderTrace where
-  forMachine dtal (BuilderNewTx name txId dests inputs outputs) = mconcat $
+  forMachine dtal (BuilderNewTx name txKey dests inputs outputs) = mconcat $
        [ "builder" .= name
-       , "txId"    .= String (Api.serialiseToRawBytesHexText txId)
+       , renderTxKey txKey
        ]
     ++ [ "destinations" .= map Api.serialiseAddress dests
        | dtal >= Logging.DMaximum
@@ -303,15 +313,25 @@ instance Logging.LogFormatting BuilderTrace where
     ++ [ "inputs" .= map (renderFund dtal) inputs
        | dtal >= Logging.DDetailed
        ]
-  forHuman (BuilderNewTx name txId _dest inputs outputs) =
+  forHuman (BuilderNewTx name txKey _dest inputs outputs) =
        "NewTx [" <> Text.pack name <> "] "
-    <> Api.serialiseToRawBytesHexText txId
+    <> Hash.hashToTextAsHex (Chain.txKeyHash txKey)
     <> " inputs=["  <> renderFundTxIns inputs  <> "]"
     <> " outputs=[" <> renderFundTxIns outputs <> "]"
   forHuman (BuilderInputsDropped name inputs reason) =
        "InputsDropped [" <> Text.pack name <> "] "
     <> "reason=" <> Text.pack reason
     <> " inputs=[" <> renderFundTxIns inputs <> "]"
+
+-- | Render a payload key as machine-format fields: @txHash@ always, @txId@
+-- when the key has one (see 'Chain.TxKey'). Both are 32 bytes of hex, so the
+-- field is the only thing that says which is which.
+renderTxKey :: Chain.TxKey -> Object
+renderTxKey txKey = mconcat $
+     [ "txHash" .= String (Hash.hashToTextAsHex (Chain.txKeyHash txKey)) ]
+  ++ [ "txId"   .= String (Api.serialiseToRawBytesHexText txId)
+     | Just txId <- [Chain.txKeyId txKey]
+     ]
 
 -- | Render a single fund for 'forMachine' output.
 --
@@ -367,9 +387,9 @@ instance Logging.MetaTrace PipeTrace where
 -- | Machine format: every Pipe event always carries @pipe@ + @depth@ (the
 -- namespace already says which queue). Input events add @count@ at
 -- 'Logging.DDetailed' and above and an @inputs@ array of rendered funds at
--- 'Logging.DMaximum' (see 'renderFund'). Payload events add a @txId@ at
--- 'Logging.DMaximum'. Human format shows just the depth (and, for inputs, the
--- count).
+-- 'Logging.DMaximum' (see 'renderFund'). Payload events add the payload's key
+-- at 'Logging.DMaximum' (see 'renderTxKey' for the fields it lands in). Human
+-- format shows just the depth (and, for inputs, the count).
 instance Logging.LogFormatting PipeTrace where
   forMachine dtal (PipeInputsEnqueued name depth inputs) = mconcat $
        [ "pipe"  .= name
@@ -391,18 +411,18 @@ instance Logging.LogFormatting PipeTrace where
     ++ [ "inputs" .= map (renderFund dtal) inputs
        | dtal >= Logging.DMaximum
        ]
-  forMachine dtal (PipePayloadEnqueued name depth txId) = mconcat $
+  forMachine dtal (PipePayloadEnqueued name depth txKey) = mconcat $
        [ "pipe"  .= name
        , "depth" .= depth
        ]
-    ++ [ "txId" .= String (Api.serialiseToRawBytesHexText txId)
+    ++ [ renderTxKey txKey
        | dtal >= Logging.DMaximum
        ]
-  forMachine dtal (PipePayloadDequeued name depth txId) = mconcat $
+  forMachine dtal (PipePayloadDequeued name depth txKey) = mconcat $
        [ "pipe"  .= name
        , "depth" .= depth
        ]
-    ++ [ "txId" .= String (Api.serialiseToRawBytesHexText txId)
+    ++ [ renderTxKey txKey
        | dtal >= Logging.DMaximum
        ]
   forHuman (PipeInputsEnqueued name depth inputs) =
@@ -413,10 +433,10 @@ instance Logging.LogFormatting PipeTrace where
        "InputsDequeued [" <> Text.pack name <> "]"
     <> " depth=" <> Text.pack (show depth)
     <> " count=" <> Text.pack (show (length inputs))
-  forHuman (PipePayloadEnqueued name depth _txId) =
+  forHuman (PipePayloadEnqueued name depth _txKey) =
        "PayloadEnqueued [" <> Text.pack name <> "]"
     <> " depth=" <> Text.pack (show depth)
-  forHuman (PipePayloadDequeued name depth _txId) =
+  forHuman (PipePayloadDequeued name depth _txKey) =
        "PayloadDequeued [" <> Text.pack name <> "]"
     <> " depth=" <> Text.pack (show depth)
 
@@ -455,17 +475,18 @@ instance Logging.MetaTrace RecyclerTrace where
 -- | Machine format: every event emits @recycler@ and @backlog@ (the
 -- resulting backlog size, not a queue depth). 'RecyclerAddToBacklog'
 -- carries the added entry: @consumed_count@ and @outputs_count@ at
--- 'Logging.DDetailed', the payload's @txId@ and the @consumed@ and
+-- 'Logging.DDetailed', the payload's key (see 'renderTxKey') and the
+-- @consumed@ and
 -- @outputs@ fund arrays (see 'renderFund') at 'Logging.DMaximum'.
 -- 'RecyclerAddToPipe' (which also emits @pipe@) adds a @count@ at
 -- 'Logging.DDetailed' and an @inputs@ array of the recycled funds at
 -- 'Logging.DMaximum'. 'RecyclerReset' (also with @pipe@) adds @count@ for
 -- the fresh inputs, @dropped_inputs_count@ and @dropped_payloads_count@ at
 -- 'Logging.DDetailed', plus the @inputs@ (fresh), @dropped_inputs@ and
--- @dropped_payloads@ (txIds) arrays at 'Logging.DMaximum'.
+-- @dropped_payloads@ (payload keys as hex) arrays at 'Logging.DMaximum'.
 -- Human format shows the backlog size and the counts.
 instance Logging.LogFormatting RecyclerTrace where
-  forMachine dtal (RecyclerAddToBacklog recyclerName backlog txId consumed outputs) =
+  forMachine dtal (RecyclerAddToBacklog recyclerName backlog txKey consumed outputs) =
     mconcat $
        [ "recycler" .= recyclerName
        , "backlog"  .= backlog
@@ -476,7 +497,7 @@ instance Logging.LogFormatting RecyclerTrace where
     ++ [ "outputs_count" .= length outputs
        | dtal >= Logging.DDetailed
        ]
-    ++ [ "txId" .= String (Api.serialiseToRawBytesHexText txId)
+    ++ [ renderTxKey txKey
        | dtal >= Logging.DMaximum
        ]
     ++ [ "consumed" .= map (renderFund dtal) consumed
@@ -518,10 +539,10 @@ instance Logging.LogFormatting RecyclerTrace where
        | dtal >= Logging.DMaximum
        ]
     ++ [ "dropped_payloads" .=
-           map (String . Api.serialiseToRawBytesHexText) droppedPayloads
+           map (String . Hash.hashToTextAsHex . Chain.txKeyHash) droppedPayloads
        | dtal >= Logging.DMaximum
        ]
-  forHuman (RecyclerAddToBacklog recyclerName backlog _txId consumed outputs) =
+  forHuman (RecyclerAddToBacklog recyclerName backlog _txKey consumed outputs) =
        "AddToBacklog [" <> Text.pack recyclerName <> "]"
     <> " backlog=" <> Text.pack (show backlog)
     <> " consumed_count=" <> Text.pack (show (length consumed))
@@ -557,14 +578,14 @@ instance Logging.MetaTrace ObserverTrace where
     ]
 
 instance Logging.LogFormatting ObserverTrace where
-  forMachine _ (ObserverAnnounce observer txId isOrphan) = mconcat
+  forMachine _ (ObserverAnnounce observer txKey isOrphan) = mconcat
     [ "observer" .= observer
-    , "txId"     .= String (Api.serialiseToRawBytesHexText txId)
+    , renderTxKey txKey
     , "isOrphan" .= isOrphan
     ]
-  forHuman (ObserverAnnounce observer txId isOrphan) =
+  forHuman (ObserverAnnounce observer txKey isOrphan) =
        "Announce [" <> Text.pack observer <> "]"
-    <> " txId=" <> Api.serialiseToRawBytesHexText txId
+    <> " txHash=" <> Hash.hashToTextAsHex (Chain.txKeyHash txKey)
     <> (if isOrphan then " (orphan)" else " (confirmed)")
 
 --------------------------------------------------------------------------------
@@ -895,3 +916,4 @@ instance Logging.MetaTrace (AnyMessage KA.KeepAlive) where
       , Logging.Namespace [] ["KeepAliveResponse"]
       , Logging.Namespace [] ["Done"]
       ]
+

@@ -9,10 +9,10 @@
 -- "Cardano.Benchmarking.TxCentrifuge.NodeToNode.TxIdSync". N2C ChainSync
 -- delivers full deserialized blocks (not just headers), so the entire
 -- pipeline collapses into a single ChainSync client and no separate
--- BlockFetch client or intermediate header queue is needed.
+-- BlockFetch/LeiosFetch client or intermediate header queue is needed.
 --
 -- @
--- N2N:  ChainSync (headers) -> header queue -> BlockFetch (blocks) -> process
+-- N2N:  ChainSync (headers) -> header queue -> *Fetch (blocks/txs) -> process
 -- N2C:  ChainSync (blocks)  ----------------------------------------> process
 -- @
 --
@@ -20,29 +20,26 @@
 -- Without inspecting the nodes' mempools, we follow the chain and
 -- broadcast two kinds of events:
 --
--- * @Right@: a transaction reached confirmation depth — its outputs
---   can be recycled.
--- * @Left@: a transaction was in a rolled-back block and did not
---   reappear in the winning fork — its original inputs can be
---   recycled.
+-- * @Right@: a transaction reached confirmation depth (its outputs can be
+--   recycled).
+-- * @Left@: a transaction was in a rolled-back block and did not reappear in
+--   the winning fork (its original inputs can be recycled).
 --
--- The @Left@ path recovers the main source of lost funds: in Cardano,
--- a rollback does not re-add the rolled-back block's transactions to
--- the mempool. Without this recovery, those inputs would be permanently
--- leaked from the recycling loop.
+-- The @Left@ path recovers the main source of lost funds: in Cardano, a
+-- rollback does not re-add the rolled-back block's transactions to the mempool.
+-- Without this recovery, those inputs would be permanently leaked from the
+-- recycling loop.
 --
--- Rolled-back transactions are not orphaned immediately. They are held
--- in limbo because the winning fork may contain some (but not all) of
--- them, possibly at different block heights. Only transactions that do
--- not reappear within 2×@confirmationDepth@ blocks are broadcast as
--- orphans.
+-- Rolled-back transactions are not orphaned immediately. They are held in limbo
+-- because the winning fork may contain some (but not all) of them, possibly at
+-- different block heights. Only transactions that do not reappear within
+-- 2×@confirmationDepth@ blocks are broadcast as orphans.
 --
--- The @confirmationDepth@ parameter (D) controls when @Right@ events
--- fire: a block is confirmed after D blocks on top. For orphans,
--- D is applied twice: the rolled-back block's replacement must first
--- be confirmed (D blocks), then the limbo entry waits D more confirmed
--- blocks to allow the tx to reappear at a different height on the
--- winning fork. Total orphan latency: 2×D blocks.
+-- The @confirmationDepth@ parameter (D) controls when @Right@ events fire: a
+-- block is confirmed after D blocks on top. For orphans, D is applied twice:
+-- the rolled-back block's replacement must first be confirmed (D blocks), then
+-- the limbo entry waits D more confirmed blocks to allow the tx to reappear at
+-- a different height on the winning fork. Total orphan latency: 2×D blocks.
 --
 -- == Usage
 --
@@ -97,7 +94,7 @@ import Control.Concurrent.STM qualified as STM
 -------------------
 -- tx-centrifuge --
 -------------------
-import Cardano.Benchmarking.TxCentrifuge.Block qualified as Block
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
 
 --------------------------------------------------------------------------------
 -- Types.
@@ -113,9 +110,9 @@ data Config = Config
 -- | N2C ChainSync delivers full deserialized blocks (not just headers).
 type ChainSyncClient =
   CS.ChainSyncClient
-    Block.CardanoBlock
-    (Net.Point Block.CardanoBlock)
-    (Net.Tip Block.CardanoBlock)
+    Chain.CardanoBlock
+    (Net.Point Chain.CardanoBlock)
+    (Net.Tip Chain.CardanoBlock)
     IO
     ()
 
@@ -132,22 +129,22 @@ data State = State
   { -- | Configuration.
     stateConfig        :: !Config
     -- | Current chain tip as reported by the node.
-  , stateCurrentTip    :: !(STM.TVar (Net.Tip Block.CardanoBlock))
+  , stateCurrentTip    :: !(STM.TVar (Net.Tip Chain.CardanoBlock))
     -- | Blocks received but not yet confirmed (ordered by block number).
     -- Uses @TVar (Seq …)@ instead of @TBQueue@ because rollbacks need to filter
     -- out blocks children of the rollback point.
-  , statePendingBlocks :: !(STM.TVar (Seq Block.CardanoBlock))
+  , statePendingBlocks :: !(STM.TVar (Seq Chain.CardanoBlock))
     -- | Tx IDs from rolled-back blocks awaiting resolution.
     -- Resolved when confirmed blocks catch up: entries whose tx ID appears in
     -- a confirmed block are removed; entries whose height has been confirmed
     -- past are broadcast as orphans (Left).
-  , stateLimbo         :: !(STM.TVar (Seq Block.BlockTx))
+  , stateLimbo         :: !(STM.TVar (Seq Chain.BlockTx))
     -- | Broadcast channel for confirmed and orphaned transactions.
     -- 'Right' = confirmed (recycle output inputs).
     -- 'Left'  = orphaned  (recycle original inputs).
     -- Write-only end; subscribers obtain a read-end via
     -- @STM.dupTChan . stateBroadcast@.
-  , stateBroadcast     :: !(STM.TChan (Either Block.BlockTx Block.BlockTx))
+  , stateBroadcast     :: !(STM.TChan (Either Chain.BlockTx Chain.BlockTx))
   }
 
 -- | Create initial sync state.
@@ -207,13 +204,13 @@ chainSyncClient state = CS.ChainSyncClient $ pure clientStIdle
             STM.writeTVar (statePendingBlocks state) keep
             -- Discarded blocks: Append discarded txs IDs to `stateLimbo`.
             let newLimbo = Seq.fromList
-                  [ Block.BlockTx
-                      { Block.blockTxId      = txId
-                      , Block.blockTxBlockNo = Block.blockNo   block
-                      , Block.blockTxSlotNo  = Block.blockSlot block
+                  [ Chain.BlockTx
+                      { Chain.blockTxKey     = txKey
+                      , Chain.blockTxBlockNo = Block.blockNo   block
+                      , Chain.blockTxSlotNo  = Block.blockSlot block
                       }
                   | block <- toList discard
-                  , txId  <- Block.extractTxIds block
+                  , txKey <- Chain.extractTxKeys block
                   ]
             STM.modifyTVar' (stateLimbo state) (\q -> q <> newLimbo)
             ---------- STM ENDED ----------
@@ -232,16 +229,22 @@ chainSyncClient state = CS.ChainSyncClient $ pure clientStIdle
 --
 -- TODO: This is identical to 'NodeToNode.TxIdSync.processNewBlock'. Once
 -- recycling of "due" transactions is added to both, extract the shared logic
--- into a common helper (e.g. in Block.hs) parameterised over the common state
+-- into a common helper (e.g. in Chain.hs) parameterised over the common state
 -- fields.
-processNewBlock :: State -> Block.CardanoBlock -> STM.STM ()
+processNewBlock :: State -> Chain.CardanoBlock -> STM.STM ()
 processNewBlock state newBlock = do
+  -- The eras have to agree or no transaction this generator built can ever be
+  -- matched, see 'Chain.eraMismatch'. Checked per block, which is once a slot
+  -- and a string comparison.
+  case Chain.eraMismatch newBlock of
+    Just reason -> STM.throwSTM $ userError $ "observer: " ++ reason
+    Nothing     -> pure ()
   tip           <- STM.readTVar (stateCurrentTip    state)
   pendingBlocks <- STM.readTVar (statePendingBlocks state)
   -- Appends the new block and splits the ordered `Seq` of blocks into two.
   let (confirmedBlocks, remainingBlocks) =
        let depth = fromIntegral
-                     (confirmationDepth (stateConfig state)) :: Block.BlockNo
+                     (confirmationDepth (stateConfig state)) :: Chain.BlockNo
            isBlockConfirmed block = case tip of
              Net.TipGenesis         -> False
              Net.Tip _ _ tipBlockNo -> tipBlockNo >= Block.blockNo block + depth
@@ -251,13 +254,13 @@ processNewBlock state newBlock = do
   STM.writeTVar (statePendingBlocks state) remainingBlocks
   -- Broadcast each confirmed transaction.
   forM_ confirmedBlocks $ \block -> do -- No `toList`, skips intermediate list.
-    forM_ (Block.extractTxIds block) $ \txId -> do
+    forM_ (Chain.extractTxKeys block) $ \txKey -> do
       STM.writeTChan
         (stateBroadcast state)
-        (Right Block.BlockTx
-          { Block.blockTxId      = txId
-          , Block.blockTxBlockNo = Block.blockNo   block
-          , Block.blockTxSlotNo  = Block.blockSlot block
+        (Right Chain.BlockTx
+          { Chain.blockTxKey     = txKey
+          , Chain.blockTxBlockNo = Block.blockNo   block
+          , Chain.blockTxSlotNo  = Block.blockSlot block
           }
         )
   -- Resolve limbo against confirmed blocks.
@@ -268,23 +271,24 @@ processNewBlock state newBlock = do
   limbo <- STM.readTVar (stateLimbo state)
   let (keepLimbo, toOrphan) =
         let depth = fromIntegral
-                      (confirmationDepth (stateConfig state)) :: Block.BlockNo
+                      (confirmationDepth (stateConfig state)) :: Chain.BlockNo
             lastConfirmedBlockNo = case confirmedBlocks of
               _ Seq.:|> lastConfirmedBlock -> Block.blockNo lastConfirmedBlock
               _                            -> 0
-            -- Extract confirmed txs IDs to a set, more efficient queries.
-            confirmedTxIdSet =
+            -- Extract the confirmed transactions' keys to a set, more
+            -- efficient queries.
+            confirmedTxKeys =
               Set.fromList
-                [ txId
+                [ txKey
                 | block <- toList confirmedBlocks
-                , txId  <- Block.extractTxIds block
+                , txKey <- Chain.extractTxKeys block
                 ]
-            blockTxConfirmed e = Block.blockTxId e `Set.member` confirmedTxIdSet
+            blockTxConfirmed e = Chain.blockTxKey e `Set.member` confirmedTxKeys
             -- Allow confirmationDepth extra blocks for the tx to reappear at a
             -- different height on the winning fork. Forks deeper than
             -- confirmationDepth already cause permanent fund loss by design.
             pastConfirmed    e =
-              lastConfirmedBlockNo >= Block.blockTxBlockNo e + depth
+              lastConfirmedBlockNo >= Chain.blockTxBlockNo e + depth
         in
             -- partition, not spanl!
             -- The limbo is unordered (multiple rollbacks at different heights).

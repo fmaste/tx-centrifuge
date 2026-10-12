@@ -1,7 +1,6 @@
 {-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE TypeApplications #-}
 
 -- cardano-api 11 deprecates Api.getTxBody in favour of UnsignedTx from
 -- Cardano.Api.Experimental. This package stays on the stable API so one source
@@ -47,6 +46,8 @@ import Test.Tasty.HUnit qualified as HUnit
 ---------------------
 -- tx-centrifuge --
 ---------------------
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
+import Cardano.Benchmarking.TxCentrifuge.Era (Era, era)
 import Cardano.Benchmarking.TxCentrifuge.Fund qualified as Fund
 import Cardano.Benchmarking.TxCentrifuge.TxAssembly qualified as TxAssembly
 
@@ -58,29 +59,33 @@ txTests = Tasty.testGroup "node"
       (signKey, addr) <- testSetup
       let fund = mkDummyFund signKey 0 10_000_000
           fee  = L.Coin 200_000
-      case TxAssembly.buildTx Api.ShelleyBasedEraConway [(signKey, addr)] [fund] 1 fee of
+      case TxAssembly.buildTx era [(signKey, addr)] [fund] 1 fee of
         Left err ->
           HUnit.assertFailure $ "buildTx failed: " ++ show err
-        Right (tx, outFunds) -> do
+        Right (tx, txKey, outFunds) -> do
           -- One output fund recycled.
           length outFunds @?= 1
+          -- The key's id is the body's, derived here independently.
+          Chain.txKeyId txKey @?= Just (Api.getTxId (Api.getTxBody tx))
+          -- The key's hash is of the signed transaction's bytes, which is what
+          -- an endorser block lists, not of its body.
+          Chain.txKeyHash txKey @?= Chain.hashTxBytes (Api.serialiseToCBOR tx)
           -- Output value = input - fee.
           Fund.fundLovelace (head outFunds) @?= (10_000_000 - 200_000)
           -- The recycled fund's TxIn references the new tx.
-          let txId = Api.getTxId (Api.getTxBody tx)
           Fund.fundTxIn (head outFunds)
-            @?= Api.TxIn txId (Api.TxIx 0)
+            @?= Api.TxIn (Api.getTxId (Api.getTxBody tx)) (Api.TxIx 0)
 
   , HUnit.testCase "buildTx: 2-in-3-out transaction" $ do
       (signKey, addr) <- testSetup
       let fund1 = mkDummyFund signKey 0 5_000_000
           fund2 = mkDummyFund signKey 1 5_000_000
           fee   = L.Coin 200_000
-      case TxAssembly.buildTx Api.ShelleyBasedEraConway [(signKey, addr)]
+      case TxAssembly.buildTx era [(signKey, addr)]
              [fund1, fund2] 3 fee of
         Left err ->
           HUnit.assertFailure $ "buildTx failed: " ++ show err
-        Right (_tx, outFunds) -> do
+        Right (_tx, _txKey, outFunds) -> do
           -- Three output funds.
           length outFunds @?= 3
           -- Total output = total input - fee.
@@ -91,7 +96,7 @@ txTests = Tasty.testGroup "node"
       (signKey, addr) <- testSetup
       let fund = mkDummyFund signKey 0 100_000
           fee  = L.Coin 200_000
-      case TxAssembly.buildTx Api.ShelleyBasedEraConway [(signKey, addr)] [fund] 1 fee of
+      case TxAssembly.buildTx era [(signKey, addr)] [fund] 1 fee of
         Left _  -> pure () -- expected
         Right _ ->
           HUnit.assertFailure
@@ -100,7 +105,7 @@ txTests = Tasty.testGroup "node"
   , HUnit.testCase "buildTx: no input funds" $ do
       (signKey, addr) <- testSetup
       let fee = L.Coin 200_000
-      case TxAssembly.buildTx Api.ShelleyBasedEraConway [(signKey, addr)] [] 1 fee of
+      case TxAssembly.buildTx era [(signKey, addr)] [] 1 fee of
         Left _  -> pure () -- expected
         Right _ ->
           HUnit.assertFailure
@@ -110,7 +115,7 @@ txTests = Tasty.testGroup "node"
       (signKey, addr) <- testSetup
       let fund = mkDummyFund signKey 0 10_000_000
           fee  = L.Coin 200_000
-      case TxAssembly.buildTx Api.ShelleyBasedEraConway [(signKey, addr)] [fund] 0 fee of
+      case TxAssembly.buildTx era [(signKey, addr)] [fund] 0 fee of
         Left _  -> pure () -- expected
         Right _ ->
           HUnit.assertFailure
@@ -154,15 +159,15 @@ txTests = Tasty.testGroup "node"
   where
     -- Build N txs sequentially, recycling the first output each time.
     go :: Int -> Fund.Fund
-       -> Api.AddressInEra Api.ConwayEra
+       -> Api.AddressInEra Era
        -> Api.SigningKey Api.PaymentKey -> L.Coin -> IO ()
     go 0 _ _ _ _ = pure ()
     go remaining fund addr signKey fee =
-      case TxAssembly.buildTx Api.ShelleyBasedEraConway [(signKey, addr)] [fund] 1 fee of
+      case TxAssembly.buildTx era [(signKey, addr)] [fund] 1 fee of
         Left err ->
           error $ "throughput test: buildTx failed at iteration "
             ++ show remaining ++ ": " ++ show err
-        Right (_, outFunds) ->
+        Right (_, _, outFunds) ->
           go (remaining - 1) (head outFunds) addr signKey fee
 
 --------------------------------------------------------------------------------
@@ -174,13 +179,13 @@ txTests = Tasty.testGroup "node"
 -- so none are loaded here.
 testSetup
   :: IO ( Api.SigningKey Api.PaymentKey
-        , Api.AddressInEra Api.ConwayEra
+        , Api.AddressInEra Era
         )
 testSetup = do
   signKey <- Api.generateSigningKey Api.AsPaymentKey
   let networkId = Api.Testnet (Api.NetworkMagic 42)
       addr = Api.shelleyAddressInEra
-        (Api.shelleyBasedEra @Api.ConwayEra)
+        era
         $ Api.makeShelleyAddress networkId
             (Api.PaymentCredentialByKey
               (Api.verificationKeyHash

@@ -116,7 +116,8 @@ import PullFiction.WorkloadRunner (runWorkload)
 ---------------------------
 -- tx-centrifuge:cardano --
 ---------------------------
-import Cardano.Benchmarking.TxCentrifuge.Block qualified as Block
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
+import Cardano.Benchmarking.TxCentrifuge.Era (Era, era)
 import Cardano.Benchmarking.TxCentrifuge.NodeToClient qualified as N2C
 import Cardano.Benchmarking.TxCentrifuge.NodeToClient.TxIdSync
   qualified as TxIdSyncN2C
@@ -136,22 +137,6 @@ import Cardano.Benchmarking.TxCentrifuge.TxAssembly qualified as TxAssembly
 import Cardano.Benchmarking.TxCentrifuge.Tracing.Dispatcher
   qualified as TracingDispatcher
 
---------------------------------------------------------------------------------
--- Era
---------------------------------------------------------------------------------
-
--- | The Shelley-based era this generator builds and submits transactions in.
--- Every era-specific type in this module is written in terms of 'Era', and
--- 'era' below is its value-level witness. Moving to another era means changing
--- these two definitions (and wiring the era through the rest of the pipeline).
-type Era = Api.ConwayEra
-
--- | Value-level witness of 'Era', for cardano-api builders that take an
--- 'Api.ShelleyBasedEra' argument (such as 'TxAssembly.buildTx').
-era :: Api.ShelleyBasedEra Era
-era = Api.ShelleyBasedEraConway
-
---------------------------------------------------------------------------------
 
 main :: IO ()
 main = do
@@ -256,21 +241,19 @@ main = do
               die $ "TxAssembly.buildTx: invalid builder parameters: " ++ reason
             Left (TxAssembly.LedgerFailure reason) ->
               die $ "TxAssembly.buildTx: ledger construction failed: " ++ reason
-            Right (tx, outputFunds) -> do
-              -- The TxID is needed for the "on_confirm" recycling strategy.
-              let txId = Api.getTxId (Api.getTxBody tx)
+            Right (tx, txKey, outputFunds) -> do
               -- Trace the newly built transaction
               -- (TxCentrifuge.Builder.NewTx), purely a construction event, no
               -- pipe/queue info.
               Tracing.traceWith
                 (Tracing.trBuilder tracers)
                 (Tracing.BuilderNewTx
-                  builderName txId
+                  builderName txKey
                   -- The destination addresses.
                   (map snd (destinations builder))
                   inputFunds outputFunds
                 )
-              Runtime.baAddPayload api txId tx inputFunds outputFunds
+              Runtime.baAddPayload api txKey tx inputFunds outputFunds
 
   -- Pipe-events factory passed to 'Runtime.resolve'. Returns a 'PipeHandle'
   -- Given builder's zero-based index, builder name and input queue name create
@@ -384,8 +367,8 @@ main = do
                 (Tracing.RecyclerAddToPipe
                   builderName inputQueueName backlog inputs
                 )
-            -- The trace keeps the dropped payloads by txId (their key), not
-            -- the full transactions.
+            -- The trace keeps the dropped payloads by key, not the full
+            -- transactions.
           , Runtime.rhOnReset = \droppedInputs droppedPayloads fresh backlog ->
               Tracing.traceWith (Tracing.trRecycler tracers)
                 (Tracing.RecyclerReset
@@ -414,11 +397,11 @@ main = do
               chan <- STM.atomically $ STM.dupTChan broadcast
               forever $ do
                 eitherBlockTx <- STM.atomically $ STM.readTChan chan
-                let (isOrphan, txId) = case eitherBlockTx of
-                      Left  blockTx -> (True,  Block.blockTxId blockTx)
-                      Right blockTx -> (False, Block.blockTxId blockTx)
+                let (isOrphan, txKey) = case eitherBlockTx of
+                      Left  blockTx -> (True,  Chain.blockTxKey blockTx)
+                      Right blockTx -> (False, Chain.blockTxKey blockTx)
                 Tracing.traceWith (Tracing.trObserver tracers)
-                  (Tracing.ObserverAnnounce observerName txId isOrphan)
+                  (Tracing.ObserverAnnounce observerName txKey isOrphan)
         case observer of
           -- N2N: ChainSync (headers) + BlockFetch (blocks) + KeepAlive.
           --------------------------------------------------------------
@@ -433,6 +416,13 @@ main = do
                   , N2N.clientBlockFetch =
                       Just $ TxIdSyncN2N.blockFetchClient syncState
                   , N2N.clientKeepAlive  = Just keepAlive
+#ifdef LEIOS_PROTOTYPE
+                    -- Recovers the transactions of a Leios block, which
+                    -- ChainSync and BlockFetch cannot see: they are announced
+                    -- by the block, not carried in it.
+                  , N2N.clientLeiosFetch =
+                      Just $ TxIdSyncN2N.leiosFetchClient observerName syncState
+#endif
                   }
             addrInfo <- resolveAddr addr port
             pure Runtime.ObserverHandle
@@ -454,7 +444,8 @@ main = do
               , Runtime.ohSubscribe = do
                   chan <- STM.atomically $
                     STM.dupTChan (TxIdSyncN2N.stateBroadcast syncState)
-                  -- Reduce each broadcast BlockTx to its TxId (the recycle key).
+                  -- Reduce each broadcast BlockTx to its key, the identifier
+                  -- the observer read (see 'Chain.BlockTx').
                   -- TODO: own-traffic filter. This adapter is where a future
                   -- filter should drop foreign events (txIds this generator
                   -- never built) before any forwarder, recovery query or reset
@@ -467,8 +458,8 @@ main = do
                   pure $ do
                     eitherBlockTx <- STM.readTChan chan
                     pure $ case eitherBlockTx of
-                      Left  blockTx -> Left  (Block.blockTxId blockTx)
-                      Right blockTx -> Right (Block.blockTxId blockTx)
+                      Left  blockTx -> Left  (Chain.blockTxKey blockTx)
+                      Right blockTx -> Right (Chain.blockTxKey blockTx)
               }
           -- N2C: LocalChainSync (full blocks, no BlockFetch needed).
           -----------------------------------------------------------
@@ -497,14 +488,15 @@ main = do
               , Runtime.ohSubscribe = do
                   chan <- STM.atomically $
                     STM.dupTChan (TxIdSyncN2C.stateBroadcast syncState)
-                  -- Reduce each broadcast BlockTx to its TxId (the recycle key).
+                  -- Reduce each broadcast BlockTx to its key, the identifier
+                  -- the observer read (see 'Chain.BlockTx').
                   -- TODO: own-traffic filter, same spot as the N2N adapter
                   -- above (see the note there).
                   pure $ do
                     eitherBlockTx <- STM.readTChan chan
                     pure $ case eitherBlockTx of
-                      Left  blockTx -> Left  (Block.blockTxId blockTx)
-                      Right blockTx -> Right (Block.blockTxId blockTx)
+                      Left  blockTx -> Left  (Chain.blockTxKey blockTx)
+                      Right blockTx -> Right (Chain.blockTxKey blockTx)
               }
 
   -- The 'TargetWorker' callback (the last caller-supplied handler): run once
@@ -823,7 +815,7 @@ loadConfig
           -- and with its use-site params checked, read when folded.
         , InitialFunds
           -- | Codec config for serialising blocks on the wire.
-        , CodecConfig Block.CardanoBlock
+        , CodecConfig Chain.CardanoBlock
           -- | Network id, for cardano-api: it decides the network bit of every
           -- address this generator derives, and so the pseudo-TxIn of a
           -- genesis fund. Only mainnet-or-not reaches an address; the magic
@@ -983,7 +975,7 @@ mkConsensusProtocol nodeConfig =
             byronCfg shelleyCfg alonzoCfg conwayCfg
             dijkstraCfg hardforkCfg checkpointsCfg Nothing)
 
-protocolToCodecConfig :: SomeConsensusProtocol -> IO (CodecConfig Block.CardanoBlock)
+protocolToCodecConfig :: SomeConsensusProtocol -> IO (CodecConfig Chain.CardanoBlock)
 protocolToCodecConfig (SomeConsensusProtocol Api.CardanoBlockType info) =
 #if MIN_VERSION_ouroboros_consensus(4,0,0) || defined(LEIOS_PROTOTYPE)
     -- "ouroboros-consensus" 4 made `protocolInfo` monadic (so the KES agent

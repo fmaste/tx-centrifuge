@@ -1,19 +1,20 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE ImportQualifiedPost #-}
 
 --------------------------------------------------------------------------------
 
--- | Transaction confirmation tracking via ChainSync and BlockFetch
+-- | Transaction confirmation tracking via ChainSync and BlockFetch/LeiosFetch
 -- (NodeToNode).
 --
 -- This is the NodeToNode counterpart of
 -- "Cardano.Benchmarking.TxCentrifuge.NodeToClient.TxIdSync". N2N ChainSync
 -- delivers only headers, so a separate BlockFetch client is needed to
--- retrieve full block bodies. The two clients share state via
--- @stateHeaders@.
+-- retrieve ranking blocks (RBs) bodies and LeiosFetch to retrieve endorser
+-- blocks (RBs) transactions. The two clients share state via @stateHeaders@.
 --
 -- @
--- N2N:  ChainSync (headers) -> header queue -> BlockFetch (blocks) -> process
+-- N2N:  ChainSync (headers) -> header queue -> *Fetch (blocks/txs) -> process
 -- N2C:  ChainSync (blocks)  ----------------------------------------> process
 -- @
 --
@@ -21,29 +22,26 @@
 -- Without inspecting the nodes' mempools, we follow the chain and
 -- broadcast two kinds of events:
 --
--- * @Right@: a transaction reached confirmation depth — its outputs
---   can be recycled.
--- * @Left@: a transaction was in a rolled-back block and did not
---   reappear in the winning fork — its original inputs can be
---   recycled.
+-- * @Right@: a transaction reached confirmation depth (its outputs can be
+--   recycled).
+-- * @Left@: a transaction was in a rolled-back block and did not reappear in
+--   the winning fork (its original inputs can be recycled).
 --
--- The @Left@ path recovers the main source of lost funds: in Cardano,
--- a rollback does not re-add the rolled-back block's transactions to
--- the mempool. Without this recovery, those inputs would be permanently
--- leaked from the recycling loop.
+-- The @Left@ path recovers the main source of lost funds: in Cardano, a
+-- rollback does not re-add the rolled-back block's transactions to the mempool.
+-- Without this recovery, those inputs would be permanently leaked from the
+-- recycling loop.
 --
--- Rolled-back transactions are not orphaned immediately. They are held
--- in limbo because the winning fork may contain some (but not all) of
--- them, possibly at different block heights. Only transactions that do
--- not reappear within 2×@confirmationDepth@ blocks are broadcast as
--- orphans.
+-- Rolled-back transactions are not orphaned immediately. They are held in limbo
+-- because the winning fork may contain some (but not all) of them, possibly at
+-- different block heights. Only transactions that do not reappear within
+-- 2×@confirmationDepth@ blocks are broadcast as orphans.
 --
--- The @confirmationDepth@ parameter (D) controls when @Right@ events
--- fire: a block is confirmed after D blocks on top. For orphans,
--- D is applied twice: the rolled-back block's replacement must first
--- be confirmed (D blocks), then the limbo entry waits D more confirmed
--- blocks to allow the tx to reappear at a different height on the
--- winning fork. Total orphan latency: 2×D blocks.
+-- The @confirmationDepth@ parameter (D) controls when @Right@ events fire: a
+-- block is confirmed after D blocks on top. For orphans, D is applied twice:
+-- the rolled-back block's replacement must first be confirmed (D blocks), then
+-- the limbo entry waits D more confirmed blocks to allow the tx to reappear at
+-- a different height on the winning fork. Total orphan latency: 2×D blocks.
 --
 -- == Header Queue (@stateHeaders@)
 --
@@ -51,8 +49,8 @@
 -- Both protocols can remove headers from it:
 -- * __ChainSync__ filters out headers children of the rollback point on
 --   @MsgRollBackward@.
--- * __BlockFetch__ claims the head on @MsgBlock@ (block received) or filters
---   it out on @MsgNoBlocks@ (block no longer available on the node).
+-- * __BlockFetch__ claims the head on @MsgBlock@ (block received) or filters it
+--   out on @MsgNoBlocks@ (block no longer available on the node).
 --
 -- == Usage
 --
@@ -79,6 +77,9 @@ module Cardano.Benchmarking.TxCentrifuge.NodeToNode.TxIdSync
     -- * Protocol Clients
   , chainSyncClient
   , blockFetchClient
+#ifdef LEIOS_PROTOTYPE
+  , leiosFetchClient
+#endif
   ) where
 
 --------------------------------------------------------------------------------
@@ -115,7 +116,11 @@ import Control.Concurrent.STM qualified as STM
 -------------------
 -- tx-centrifuge --
 -------------------
-import Cardano.Benchmarking.TxCentrifuge.Block qualified as Block
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
+#ifdef LEIOS_PROTOTYPE
+import Cardano.Benchmarking.TxCentrifuge.NodeToNode.LeiosFetch qualified as LeiosFetch
+import LeiosDemoTypes qualified as Leios
+#endif
 
 --------------------------------------------------------------------------------
 -- Types.
@@ -131,17 +136,17 @@ data Config = Config
 -- | BlockFetch client for retrieving full block bodies.
 type BlockFetchClient =
   BF.BlockFetchClient
-    Block.CardanoBlock
-    (Net.Point Block.CardanoBlock)
+    Chain.CardanoBlock
+    (Net.Point Chain.CardanoBlock)
     IO
     ()
 
 -- | ChainSync client for following the chain tip (receives headers).
 type ChainSyncClient =
   CS.ChainSyncClient
-    (Block.Header Block.CardanoBlock)
-    (Net.Point Block.CardanoBlock)
-    (Net.Tip Block.CardanoBlock)
+    (Block.Header Chain.CardanoBlock)
+    (Net.Point Chain.CardanoBlock)
+    (Net.Tip Chain.CardanoBlock)
     IO
     ()
 
@@ -154,28 +159,46 @@ data State = State
   { -- | Configuration.
     stateConfig        :: !Config
     -- | Current chain tip as reported by the node.
-  , stateCurrentTip    :: !(STM.TVar (Net.Tip Block.CardanoBlock))
+  , stateCurrentTip    :: !(STM.TVar (Net.Tip Chain.CardanoBlock))
     -- | Headers received from ChainSync, waiting for BlockFetch.
     -- Removed by both ChainSync (rollback filter) and BlockFetch (claim on
     -- block received, filter on block unavailable).
     -- Uses @TVar (Seq …)@ instead of @TBQueue@ because both removal patterns
     -- need filtered access, which TBQueue does not support.
-  , stateHeaders       :: !(STM.TVar (Seq (Block.Header Block.CardanoBlock)))
+  , stateHeaders       :: !(STM.TVar (Seq (Block.Header Chain.CardanoBlock)))
     -- | Blocks fetched but not yet confirmed (ordered by block number).
     -- Uses @TVar (Seq …)@ instead of @TBQueue@ because both removal patterns
     -- need filtered access, which TBQueue does not support.
-  , statePendingBlocks :: !(STM.TVar (Seq Block.CardanoBlock))
+  , statePendingBlocks :: !(STM.TVar (Seq Chain.CardanoBlock))
     -- | Tx IDs from rolled-back blocks awaiting resolution.
     -- Resolved when confirmed blocks catch up: entries whose tx ID appears in
     -- a confirmed block are removed; entries whose height has been confirmed
     -- past are broadcast as orphans (Left).
-  , stateLimbo         :: !(STM.TVar (Seq Block.BlockTx))
+  , stateLimbo         :: !(STM.TVar (Seq Chain.BlockTx))
     -- | Broadcast channel for confirmed and orphaned transactions.
     -- 'Right' = confirmed (recycle output inputs).
     -- 'Left'  = orphaned  (recycle original inputs).
     -- Write-only end; subscribers obtain a read-end via
     -- @STM.dupTChan . stateBroadcast@.
-  , stateBroadcast     :: !(STM.TChan (Either Block.BlockTx Block.BlockTx))
+  , stateBroadcast     :: !(STM.TChan (Either Chain.BlockTx Chain.BlockTx))
+#ifdef LEIOS_PROTOTYPE
+    -- | The endorser block announced by the most recently confirmed ranking
+    -- block, which is the parent of the next one to be confirmed.
+    --
+    -- A ranking block announces an EB and only its child certifies it, so the
+    -- child needs its parent's announcement. Confirmation runs in chain order,
+    -- so carrying one announcement forward is enough; nothing has to be keyed or
+    -- filtered.
+    --
+    -- Overwritten by every confirmed block, so a block with no announcement
+    -- clears it. That is the same rule the protocol itself applies to
+    -- @praosStateLeiosAnnouncement@, and it is what makes an uncertified
+    -- announcement disappear instead of lingering.
+  , stateLeiosAnnounced :: !(STM.TVar (Maybe Leios.LeiosPoint))
+    -- | Certified endorser blocks waiting for LeiosFetch. Appended when the
+    -- certifying block is confirmed, drained by the LeiosFetch client.
+  , stateLeiosRequests  :: !(STM.TVar (Seq LeiosFetch.Request))
+#endif
   }
 
 -- | Create initial sync state.
@@ -186,6 +209,10 @@ emptyState config = do
   pendingBlocks <- STM.newTVarIO Seq.empty
   limbo         <- STM.newTVarIO Seq.empty
   broadcast     <- STM.newBroadcastTChanIO
+#ifdef LEIOS_PROTOTYPE
+  leiosAnnounced <- STM.newTVarIO Nothing
+  leiosRequests  <- STM.newTVarIO Seq.empty
+#endif
   pure State
     { stateConfig        = config
     , stateCurrentTip    = currentTip
@@ -193,6 +220,10 @@ emptyState config = do
     , statePendingBlocks = pendingBlocks
     , stateLimbo         = limbo
     , stateBroadcast     = broadcast
+#ifdef LEIOS_PROTOTYPE
+    , stateLeiosAnnounced = leiosAnnounced
+    , stateLeiosRequests  = leiosRequests
+#endif
     }
 
 --------------------------------------------------------------------------------
@@ -244,13 +275,13 @@ chainSyncClient state = CS.ChainSyncClient $ pure clientStIdle
             STM.writeTVar (statePendingBlocks state) keep
             -- Discarded blocks: Append discarded txs IDs to `stateLimbo`.
             let newLimbo = Seq.fromList
-                  [ Block.BlockTx
-                      { Block.blockTxId      = txId
-                      , Block.blockTxBlockNo = Block.blockNo   block
-                      , Block.blockTxSlotNo  = Block.blockSlot block
+                  [ Chain.BlockTx
+                      { Chain.blockTxKey     = txKey
+                      , Chain.blockTxBlockNo = Block.blockNo   block
+                      , Chain.blockTxSlotNo  = Block.blockSlot block
                       }
                   | block <- toList discard
-                  , txId  <- Block.extractTxIds block
+                  , txKey <- Chain.extractTxKeys block
                   ]
             STM.modifyTVar' (stateLimbo state) (\q -> q <> newLimbo)
             ---------- STM ENDED ----------
@@ -342,7 +373,7 @@ blockFetchClient state = BF.BlockFetchClient $ do
 -- head of the queue). Returns @False@ if the header is no longer present either
 -- because a rollback already filtered it out, or because a previous call
 -- already claimed it.
-claimHeader :: State -> Net.Point Block.CardanoBlock -> STM.STM Bool
+claimHeader :: State -> Net.Point Chain.CardanoBlock -> STM.STM Bool
 claimHeader state point = do
   headersSeq <- STM.readTVar (stateHeaders state)
   if Seq.null headersSeq
@@ -374,16 +405,22 @@ claimHeader state point = do
 --
 -- TODO: This is identical to 'NodeToClient.TxIdSync.processNewBlock'. Once
 -- recycling of "due" transactions is added to both, extract the shared logic
--- into a common helper (e.g. in Block.hs) parameterised over the common state
+-- into a common helper (e.g. in Chain.hs) parameterised over the common state
 -- fields.
-processNewBlock :: State -> Block.CardanoBlock -> STM.STM ()
+processNewBlock :: State -> Chain.CardanoBlock -> STM.STM ()
 processNewBlock state newBlock = do
+  -- The eras have to agree or no transaction this generator built can ever be
+  -- matched, see 'Chain.eraMismatch'. Checked per block, which is once a slot
+  -- and a string comparison.
+  case Chain.eraMismatch newBlock of
+    Just reason -> STM.throwSTM $ userError $ "observer: " ++ reason
+    Nothing     -> pure ()
   tip           <- STM.readTVar (stateCurrentTip    state)
   pendingBlocks <- STM.readTVar (statePendingBlocks state)
   -- Appends the new block and splits the ordered `Seq` of blocks into two.
   let (confirmedBlocks, remainingBlocks) =
        let depth = fromIntegral
-                     (confirmationDepth (stateConfig state)) :: Block.BlockNo
+                     (confirmationDepth (stateConfig state)) :: Chain.BlockNo
            isBlockConfirmed block = case tip of
              Net.TipGenesis         -> False
              Net.Tip _ _ tipBlockNo -> tipBlockNo >= Block.blockNo block + depth
@@ -393,15 +430,42 @@ processNewBlock state newBlock = do
   STM.writeTVar (statePendingBlocks state) remainingBlocks
   -- Broadcast each confirmed transaction.
   forM_ confirmedBlocks $ \block -> do -- No `toList`, skips intermediate list.
-    forM_ (Block.extractTxIds block) $ \txId -> do
+    forM_ (Chain.extractTxKeys block) $ \txKey -> do
       STM.writeTChan
         (stateBroadcast state)
-        (Right Block.BlockTx
-          { Block.blockTxId      = txId
-          , Block.blockTxBlockNo = Block.blockNo   block
-          , Block.blockTxSlotNo  = Block.blockSlot block
+        (Right Chain.BlockTx
+          { Chain.blockTxKey     = txKey
+          , Chain.blockTxBlockNo = Block.blockNo   block
+          , Chain.blockTxSlotNo  = Block.blockSlot block
           }
         )
+#ifdef LEIOS_PROTOTYPE
+    -- A CertRB is forged with an empty transaction sequence, so
+    -- 'extractTxKeys' above found nothing for it: the certified EB is its
+    -- only source. Queue
+    -- that EB for LeiosFetch now that this block is confirmed.
+    --
+    -- Announcing an EB is not enough. An announcement whose child carries no
+    -- certificate is overwritten below without ever being queued, which is
+    -- correct: it was never part of the chain.
+    --
+    -- Read before the write below, so this is the parent's announcement.
+    announced <- STM.readTVar (stateLeiosAnnounced state)
+    case announced of
+      -- The parent announced an EB and this block certifies it: fetch that EB.
+      Just point | Chain.leiosCarriesCert block ->
+        STM.modifyTVar' (stateLeiosRequests state)
+          (Seq.|> LeiosFetch.Request
+            { LeiosFetch.requestPoint   = point
+            , LeiosFetch.requestBlockNo = Block.blockNo   block
+            , LeiosFetch.requestSlotNo  = Block.blockSlot block
+            }
+          )
+      -- Nothing announced, or announced and left uncertified: nothing to fetch.
+      _ -> pure ()
+    -- Carry this block's own announcement forward for its child.
+    STM.writeTVar (stateLeiosAnnounced state) (Chain.leiosAnnouncedPoint block)
+#endif
   -- Resolve limbo against confirmed blocks.
   -- Tx IDs that reappear in a confirmed block are removed (the `Right`
   -- broadcast above already recycles their outputs).
@@ -410,23 +474,24 @@ processNewBlock state newBlock = do
   limbo <- STM.readTVar (stateLimbo state)
   let (keepLimbo, toOrphan) =
         let depth = fromIntegral
-                      (confirmationDepth (stateConfig state)) :: Block.BlockNo
+                      (confirmationDepth (stateConfig state)) :: Chain.BlockNo
             lastConfirmedBlockNo = case confirmedBlocks of
               _ Seq.:|> lastConfirmedBlock -> Block.blockNo lastConfirmedBlock
               _                            -> 0
-            -- Extract confirmed txs IDs to a set, more efficient queries.
-            confirmedTxIdSet =
+            -- Extract the confirmed transactions' keys to a set, more
+            -- efficient queries.
+            confirmedTxKeys =
               Set.fromList
-                [ txId
+                [ txKey
                 | block <- toList confirmedBlocks
-                , txId  <- Block.extractTxIds block
+                , txKey <- Chain.extractTxKeys block
                 ]
-            blockTxConfirmed e = Block.blockTxId e `Set.member` confirmedTxIdSet
+            blockTxConfirmed e = Chain.blockTxKey e `Set.member` confirmedTxKeys
             -- Allow confirmationDepth extra blocks for the tx to reappear at a
             -- different height on the winning fork. Forks deeper than
             -- confirmationDepth already cause permanent fund loss by design.
             pastConfirmed    e =
-              lastConfirmedBlockNo >= Block.blockTxBlockNo e + depth
+              lastConfirmedBlockNo >= Chain.blockTxBlockNo e + depth
         in
             -- partition, not spanl!
             -- The limbo is unordered (multiple rollbacks at different heights).
@@ -440,3 +505,27 @@ processNewBlock state newBlock = do
   forM_ toOrphan $ \entry -> do -- No `toList`, skips intermediate list.
     STM.writeTChan (stateBroadcast state) (Left entry)
 
+#ifdef LEIOS_PROTOTYPE
+
+--------------------------------------------------------------------------------
+-- LeiosFetch Client.
+--------------------------------------------------------------------------------
+
+-- | The LeiosFetch client for this state, fetching the endorser blocks that its
+-- confirmed ranking blocks certified.
+--
+-- Here rather than in
+-- "Cardano.Benchmarking.TxCentrifuge.NodeToNode.LeiosFetch" so that the request
+-- queue stays private to this module: that module cannot name 'State' anyway,
+-- since this one already imports it for 'LeiosFetch.Request'.
+leiosFetchClient
+  -- | Observer name, for the failure message if a peer lacks an endorser block.
+  :: String
+  -> State
+  -> LeiosFetch.LeiosFetchClient
+leiosFetchClient observerName state =
+  LeiosFetch.leiosFetchClient observerName
+    (stateLeiosRequests state)
+    (stateBroadcast state)
+
+#endif

@@ -53,7 +53,8 @@ import Ouroboros.Network.Protocol.TxSubmission2.Type qualified as TxSub
 -------------------
 -- tx-centrifuge --
 -------------------
-import Cardano.Benchmarking.TxCentrifuge.Block qualified as Block
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
+import Cardano.Benchmarking.TxCentrifuge.Era (Era)
 import Cardano.Benchmarking.TxCentrifuge.Tracing qualified as Tracing
 
 --------------------------------------------------------------------------------
@@ -61,8 +62,8 @@ import Cardano.Benchmarking.TxCentrifuge.Tracing qualified as Tracing
 -- | TxSubmission2 client for submitting transactions.
 type TxSubmissionClient =
   TxSub.TxSubmissionClient
-    (Mempool.GenTxId Block.CardanoBlock)
-    (Mempool.GenTx Block.CardanoBlock)
+    (Mempool.GenTxId Chain.CardanoBlock)
+    (Mempool.GenTx Chain.CardanoBlock)
     IO
     ()
 
@@ -72,9 +73,9 @@ type TxSubmissionClient =
 -- rather than re-derived on every protocol round-trip.
 data UnAckedEntry = UnAckedEntry
   { -- | For protocol announcement ('MsgReplyTxIds') and matching ('MsgRequestTxs').
-    uaeGenTxId :: !(Mempool.GenTxId Block.CardanoBlock)
+    uaeGenTxId :: !(Mempool.GenTxId Chain.CardanoBlock)
     -- | For protocol body delivery ('MsgReplyTxs').
-  , uaeGenTx   :: !(Mempool.GenTx Block.CardanoBlock)
+  , uaeGenTx   :: !(Mempool.GenTx Chain.CardanoBlock)
     -- | For protocol announcement ('MsgReplyTxIds').
   , uaeSize    :: !Net.SizeInBytes
   }
@@ -90,9 +91,9 @@ type UnAcked = Seq.Seq UnAckedEntry
 -- | Convert a cardano-api Tx to an 'UnAckedEntry', pre-computing all
 -- protocol-ready values. This is the single boundary crossing: every subsequent
 -- protocol handler works with native consensus types.
-toEntry :: Api.Tx Api.ConwayEra -> UnAckedEntry
+toEntry :: Api.Tx Era -> UnAckedEntry
 toEntry tx =
-  let !genTx   = Block.toGenTx tx
+  let !genTx   = Chain.toGenTx tx
       !genTxId = Mempool.txId genTx
       -- Wire size (CBOR-encoded). How the announced size flows:
       -- 1. Network decides whether to request the tx, checking the announced
@@ -120,7 +121,7 @@ toEntry tx =
 
 -- | Extract the protocol announcement pair from a pre-computed entry.
 entryToIdSize :: UnAckedEntry
-              -> (Mempool.GenTxId Block.CardanoBlock, Net.SizeInBytes)
+              -> (Mempool.GenTxId Chain.CardanoBlock, Net.SizeInBytes)
 entryToIdSize e = (uaeGenTxId e, uaeSize e)
 
 --------------------------------------------------------------------------------
@@ -137,9 +138,9 @@ txSubmissionClient
   -- | Max batch size per request.
   -> Natural
   -- | Blocking: wait for a token (must not fail).
-  -> IO (Api.Tx Api.ConwayEra)
+  -> IO (Api.Tx Era)
   -- | NonBlocking: poll for a token.
-  -> IO (Maybe (Api.Tx Api.ConwayEra))
+  -> IO (Maybe (Api.Tx Era))
   -> TxSubmissionClient
 txSubmissionClient tracer targetName maxBatchSize blockingFetch nonBlockingFetch =
   TxSub.TxSubmissionClient $ pure $ TxSub.ClientStIdle
@@ -164,8 +165,8 @@ txSubmissionClient tracer targetName maxBatchSize blockingFetch nonBlockingFetch
 -- first mandatory tx) and 'SingNonBlocking' requests. Stops as soon as the
 -- callback returns 'Nothing' (rate-limited).
 drainUpTo :: Int
-          -> IO (Maybe (Api.Tx Api.ConwayEra))
-          -> IO [Api.Tx Api.ConwayEra]
+          -> IO (Maybe (Api.Tx Era))
+          -> IO [Api.Tx Era]
 drainUpTo 0 _ = pure []
 drainUpTo n fetch = fetch >>= \case
   Nothing -> pure []
@@ -192,9 +193,9 @@ requestTxIds
   -- | Max batch size per request.
   -> Natural
   -- | Blocking: wait for a token (must not fail).
-  -> IO (Api.Tx Api.ConwayEra)
+  -> IO (Api.Tx Era)
   -- | NonBlocking: poll for a token.
-  -> IO (Maybe (Api.Tx Api.ConwayEra))
+  -> IO (Maybe (Api.Tx Era))
   -- | Unacknowledged transactions (oldest first).
   -> UnAcked
   -- | Blocking style singleton:
@@ -207,8 +208,8 @@ requestTxIds
   -> TxSub.NumTxIdsToReq
   -> IO ( TxSub.ClientStTxIds
             blocking
-            (Mempool.GenTxId Block.CardanoBlock)
-            (Mempool.GenTx Block.CardanoBlock)
+            (Mempool.GenTxId Chain.CardanoBlock)
+            (Mempool.GenTx Chain.CardanoBlock)
             IO
             ()
         )
@@ -227,7 +228,7 @@ requestTxIds
     Tracing.RequestTxIds
       targetName
       -- TxIds not yet acknowledged.
-      (map (Block.fromGenTxId . uaeGenTxId) (toList unacked))
+      (map (Chain.fromGenTxId . uaeGenTxId) (toList unacked))
       -- How many the node is ACKing.
       (fromIntegral ackNum)
       -- How many new TxIds it wants.
@@ -270,12 +271,12 @@ requestTxIds
       -- How many new TxIds it wanted.
       (fromIntegral reqNum)
       -- updated unacked after ACK + new.
-      (map (Block.fromGenTxId . uaeGenTxId) (toList unacked'))
+      (map (Chain.fromGenTxId . uaeGenTxId) (toList unacked'))
       -- TxIds we announced in this reply.
       (map
         (\entry ->
           ( -- Tx ID.
-            Block.fromGenTxId . uaeGenTxId $ entry
+            Chain.fromGenTxId . uaeGenTxId $ entry
             -- Tx size.
           , fromEnum $ uaeSize entry
           )
@@ -324,16 +325,16 @@ requestTxs
   -- | Max batch size per request.
   -> Natural
   -- | Blocking: wait for a token (must not fail).
-  -> IO (Api.Tx Api.ConwayEra)
+  -> IO (Api.Tx Era)
   -- | NonBlocking: poll for a token.
-  -> IO (Maybe (Api.Tx Api.ConwayEra))
+  -> IO (Maybe (Api.Tx Era))
   -- | Unacknowledged transactions (oldest first).
   -> UnAcked
   -- | Transaction IDs the node is requesting full bodies for.
-  -> [Mempool.GenTxId Block.CardanoBlock]
+  -> [Mempool.GenTxId Chain.CardanoBlock]
   -> IO ( TxSub.ClientStTxs
-            (Mempool.GenTxId Block.CardanoBlock)
-            (Mempool.GenTx Block.CardanoBlock)
+            (Mempool.GenTxId Chain.CardanoBlock)
+            (Mempool.GenTx Chain.CardanoBlock)
             IO
             ()
         )
@@ -350,7 +351,7 @@ requestTxs
     Tracing.RequestTxs
       targetName
       -- TxIds the node requested.
-      (map Block.fromGenTxId requestedTxIds)
+      (map Chain.fromGenTxId requestedTxIds)
   -- Build response.
   ------------------
   -- Match directly on consensus GenTxId (native protocol type).
@@ -364,12 +365,12 @@ requestTxs
     Tracing.ReplyTxs
       targetName
       -- TxIds the node requested.
-      (map Block.fromGenTxId requestedTxIds)
+      (map Chain.fromGenTxId requestedTxIds)
       -- TxIds we actually sent.
       (map
         (\entry ->
           ( -- Tx ID.
-            Block.fromGenTxId . uaeGenTxId $ entry
+            Chain.fromGenTxId . uaeGenTxId $ entry
             -- Tx size.
           , fromEnum $ uaeSize entry
           )

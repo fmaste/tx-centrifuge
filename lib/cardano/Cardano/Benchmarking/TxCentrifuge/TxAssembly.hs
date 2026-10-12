@@ -34,6 +34,7 @@ import Cardano.Ledger.Coin qualified as L
 -------------------
 -- tx-centrifuge --
 -------------------
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
 import Cardano.Benchmarking.TxCentrifuge.Fund ( Fund(..) )
 
 --------------------------------------------------------------------------------
@@ -66,8 +67,13 @@ data BuildError
 -- @numOutputs@ outputs, distributed round-robin over the destinations: output
 -- @i@ pays to destination @i \`mod\` n@, where @n@ is the number of
 -- destinations given, and its recycled fund is keyed with that destination's
--- signing key. Returns the signed transaction and recycled funds (one per
--- output).
+-- signing key. Returns the signed transaction, its 'Chain.TxKey' and the
+-- recycled funds (one per output).
+--
+-- The key carries both of a transaction's identifiers, the 'Chain.TxId' that
+-- a ranking block's (Praos) body gives and the 'Chain.TxHash' that an endorser
+-- block (Leios) lists. Deriving the hash here costs one serialisation more than
+-- the submission path already does for the size it announces.
 --
 -- Signing keys are extracted from the input funds. If inputs belong to
 -- different keys, all unique keys are used as witnesses. Multiple destinations
@@ -81,8 +87,11 @@ data BuildError
 -- code builds transactions in any Shelley-based era.
 -- No Plutus, no metadata, fixed fee.
 buildTx
+  -- The class as well as the witness: the witness builds and signs, the class
+  -- is what 'Api.serialiseToCBOR' needs for the 'Chain.TxHash'.
+  :: forall era. Api.IsShelleyBasedEra era
   -- | Target era (also fixes the address and output transaction types).
-  :: forall era. Api.ShelleyBasedEra era
+  => Api.ShelleyBasedEra era
   -- | Destinations for outputs: signing key and its address (which embeds
   -- the network identifier). Must be non-empty.
   -> [(Api.SigningKey Api.PaymentKey, Api.AddressInEra era)]
@@ -92,7 +101,7 @@ buildTx
   -> Natural
   -- | Fee.
   -> L.Coin
-  -> Either BuildError (Api.Tx era, [Fund])
+  -> Either BuildError (Api.Tx era, Chain.TxKey, [Fund])
 buildTx sbe destinations inFunds numOutputs fee
   | null destinations = Left (InvalidInput "no destinations")
   | null inFunds      = Left (InvalidInput "no input funds")
@@ -123,13 +132,16 @@ buildTx sbe destinations inFunds numOutputs fee
                            txBody
                            (map Api.WitnessPaymentKey uniqueKeys)
               txId = Api.getTxId txBody
+              txKey = Chain.TxKey
+                        (Chain.hashTxBytes (Api.serialiseToCBOR signedTx))
+                        (Just txId)
               outFunds = [ Fund { fundTxIn     = Api.TxIn txId (Api.TxIx ix)
                                 , fundLovelace = amt
                                 , fundSignKey  = fst (destinationFor ix)
                                 }
                          | (ix, amt) <- zip [0..] outAmounts
                          ]
-          in Right (signedTx, outFunds)
+          in Right (signedTx, txKey, outFunds)
   where
 
     totalIn :: Integer

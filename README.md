@@ -631,7 +631,7 @@ Connects to a remote node over TCP. The observer follows the chain via ChainSync
 
 #### `nodetoclient` — N2C LocalChainSync
 
-Connects to the local node over a Unix domain socket. The observer follows the chain via LocalChainSync, which delivers full blocks directly — no separate BlockFetch needed. This is simpler, and forward-compatible with Leios (see `docs/Leios.md`).
+Connects to the local node over a Unix domain socket. The observer follows the chain via LocalChainSync, which delivers full blocks directly, with no separate BlockFetch needed. It is the simpler of the two under Leios, because the node inlines a certified endorser block's transactions into the block it serves, so nothing Leios-specific is needed on this side.
 
 ```json
 "observers": {
@@ -652,18 +652,21 @@ Connects to the local node over a Unix domain socket. The observer follows the c
 
 #### Choosing between the two
 
-Both emit the same `BlockTx` events on the same broadcast channel type, so the downstream recycler and workloads are unaffected by the choice. The builder references the observer by name regardless of type:
+Both emit the same `BlockTx` events on the same broadcast channel type, so the downstream recycler and workloads are unaffected by the choice. A transaction is reported by the **Blake2b-256 hash of its serialised bytes**, which is the identifier every source has, with its **transaction id** alongside whenever it was read from a block body. Only transactions read from an endorser block come back without an id, which is the `nodetonode` observer under Leios, since an endorser block lists hashes and no ids. The builder references the observer by name regardless of type:
 
 ```json
 "recycle": { "type": "on_confirm", "params": "local-follower" }
 ```
 
-| Concern                  | `nodetonode`                        | `nodetoclient`                   |
-|--------------------------|-------------------------------------|----------------------------------|
-| Transport                | TCP (any reachable node)            | Unix socket (co-located node)    |
-| Leios forward-compatible | No — needs new IB/EB relay clients  | Yes — node serves merged blocks  |
-| Protocols on the mux     | ChainSync + BlockFetch + KeepAlive  | ChainSync only                   |
-| Requires local node      | No                                  | Yes                              |
+| Concern              | `nodetonode`                                    | `nodetoclient`                |
+|----------------------|-------------------------------------------------|-------------------------------|
+| Transport            | TCP (any reachable node)                        | Unix socket (co-located node) |
+| Under Leios          | Fetches each certified endorser block itself    | Node serves merged blocks     |
+| Protocols on the mux | ChainSync + BlockFetch + KeepAlive + LeiosFetch | ChainSync only                |
+| Requires local node  | No                                              | Yes                           |
+| Sees the chain       | As diffused                                     | As the local node resolved it |
+
+The `nodetonode` observer's LeiosFetch client is built only with the `leios-prototype` flag, since the mini-protocol exists only in the consensus that branch pins. Without it that observer sees ranking blocks alone, which on a Leios chain means it never sees the transactions a certifying block puts there.
 
 #### Full example (`nodetoclient`)
 
@@ -748,7 +751,9 @@ tx-centrifuge/
 │   │
 │   ├── cardano/                 # Cardano-specific library
 │   │   └── Cardano/Benchmarking/TxCentrifuge/
-│   │       ├── Block.hs             # Shared block types and tx extraction
+│   │       ├── Chain.hs             # The chain as the generator sees it:
+│   │       │                        # transaction identity, block types,
+│   │       │                        # extraction, the consensus boundary
 │   │       ├── Fund.hs              # UTxO/fund loading from JSON
 │   │       ├── NodeToClient.hs      # Multiplexed N2C connection (local socket)
 │   │       ├── NodeToClient/

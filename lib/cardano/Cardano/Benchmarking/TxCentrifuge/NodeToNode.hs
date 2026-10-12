@@ -68,6 +68,9 @@ import Cardano.Network.NodeToNode qualified as NtN
 -- ouroboros-consensus:diffusion --
 -----------------------------------
 import Ouroboros.Consensus.Network.NodeToNode qualified as NetN2N
+#ifdef LEIOS_PROTOTYPE
+import LeiosDemoOnlyTestFetch qualified as LF
+#endif
 ---------------------------------------------
 -- ouroboros-consensus:ouroboros-consensus --
 ---------------------------------------------
@@ -75,7 +78,7 @@ import Ouroboros.Consensus.Block.Abstract qualified as Block
 import Ouroboros.Consensus.Node.NetworkProtocolVersion qualified as NetVer
 import Ouroboros.Consensus.Node.Run ()
 -- Orphan instances needed for
--- RunNode / SupportedNetworkProtocolVersion Block.CardanoBlock
+-- RunNode / SupportedNetworkProtocolVersion Chain.CardanoBlock
 import Ouroboros.Consensus.Shelley.Ledger.SupportsProtocol ()
 ---------------------------
 -- ouroboros-network:api --
@@ -112,11 +115,15 @@ import Codec.Serialise qualified as Serialise
 -------------------
 import Cardano.Benchmarking.TxCentrifuge.NodeToNode.KeepAlive
   qualified as KeepAlive
+#ifdef LEIOS_PROTOTYPE
+import Cardano.Benchmarking.TxCentrifuge.NodeToNode.LeiosFetch
+  qualified as LeiosFetch
+#endif
 import Cardano.Benchmarking.TxCentrifuge.NodeToNode.TxIdSync
   qualified as TxIdSync
 import Cardano.Benchmarking.TxCentrifuge.NodeToNode.TxSubmission
   qualified as TxSubmission
-import Cardano.Benchmarking.TxCentrifuge.Block qualified as Block
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
 import Cardano.Benchmarking.TxCentrifuge.Tracing qualified as Tracing
 
 --------------------------------------------------------------------------------
@@ -140,6 +147,12 @@ data Clients = Clients
   , clientChainSync    :: !(Maybe TxIdSync.ChainSyncClient)
   , clientKeepAlive    :: !(Maybe KeepAlive.KeepAliveClient)
   , clientTxSubmission :: !(Maybe TxSubmission.TxSubmissionClient)
+#ifdef LEIOS_PROTOTYPE
+    -- | Fetches the endorser blocks that confirmed blocks announce. Needed
+    -- alongside ChainSync and BlockFetch to see Leios transactions at all,
+    -- since a Ranking/Praos block's body does not carry them.
+  , clientLeiosFetch   :: !(Maybe LeiosFetch.LeiosFetchClient)
+#endif
   }
 
 -- | Empty clients: all protocols disabled (null/idle clients).
@@ -149,6 +162,9 @@ emptyClients = Clients
   , clientChainSync    = Nothing
   , clientKeepAlive    = Nothing
   , clientTxSubmission = Nothing
+#ifdef LEIOS_PROTOTYPE
+  , clientLeiosFetch   = Nothing
+#endif
   }
 
 --------------------------------------------------------------------------------
@@ -176,14 +192,14 @@ emptyClients = Clients
 -- "cardano-node" it is pointed at is that branch.
 #if MIN_VERSION_ouroboros_consensus(4,0,0) || defined(LEIOS_PROTOTYPE)
 type N2NCodecs =
-  NetN2N.Codecs Block.CardanoBlock NtN.RemoteAddress
+  NetN2N.Codecs Chain.CardanoBlock NtN.RemoteAddress
     Serialise.DeserialiseFailure IO
     BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
     BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
     BSL.ByteString
 #else
 type N2NCodecs =
-  NetN2N.Codecs Block.CardanoBlock NtN.RemoteAddress
+  NetN2N.Codecs Chain.CardanoBlock NtN.RemoteAddress
     Serialise.DeserialiseFailure IO
     BSL.ByteString BSL.ByteString BSL.ByteString BSL.ByteString
     BSL.ByteString BSL.ByteString BSL.ByteString
@@ -277,6 +293,32 @@ mkKeepAliveMiniProtocol codecs tracers client = NetMux.MiniProtocol
             $ KAClient.keepAliveClientPeer client
   }
 
+#ifdef LEIOS_PROTOTYPE
+-- | Build a LeiosFetch mini-protocol.
+--
+-- Number, start mode and limits follow how ouroboros-consensus runs it
+-- (@Ouroboros.Consensus.Network.NodeToNode@): 19, on demand, and the ingress
+-- queue that @leiosFetchProtocolLimits@ derives from the Leios fetch
+-- environment. It sits in the hot bundle with ChainSync and BlockFetch, since
+-- it exists to complete what they deliver.
+mkLeiosFetchMiniProtocol
+  :: N2NCodecs
+  -> LeiosFetch.LeiosFetchClient
+  -> NetMux.MiniProtocol
+       'Mux.InitiatorMode
+       (NetCtx.MinimalInitiatorContext NtN.RemoteAddress)
+       (NetCtx.ResponderContext NtN.RemoteAddress)
+       BSL.ByteString IO () Void
+mkLeiosFetchMiniProtocol codecs client = NetMux.MiniProtocol
+  { NetMux.miniProtocolNum    = LF.leiosFetchMiniProtocolNum
+  , NetMux.miniProtocolStart  = Mux.StartOnDemand
+  , NetMux.miniProtocolLimits = NetN2N.leiosFetchProtocolLimits
+  , NetMux.miniProtocolRun    = NetMux.InitiatorProtocolOnly
+      $ NetMux.MiniProtocolCb $ \_ctx channel ->
+          Driver.runPeer mempty (NetN2N.cLeiosFetchCodec codecs) channel client
+  }
+
+#endif
 -- | Build a TxSubmission mini-protocol.
 mkTxSubmissionMiniProtocol
   :: N2NCodecs
@@ -312,7 +354,7 @@ mkTxSubmissionMiniProtocol codecs tracers client = NetMux.MiniProtocol
 -- The @Right@ case is unreachable (the mux never returns successfully).
 connect
   :: IOManager.IOManager
-  -> Block.CodecConfig Block.CardanoBlock
+  -> Block.CodecConfig Chain.CardanoBlock
   -> Magic.NetworkMagic
   -> Tracing.Tracers
   -> Socket.AddrInfo
@@ -346,9 +388,9 @@ connect
     supportedVers
       :: Map.Map
            NetVer.NodeToNodeVersion
-           (NetVer.BlockNodeToNodeVersion Block.CardanoBlock)
+           (NetVer.BlockNodeToNodeVersion Chain.CardanoBlock)
     supportedVers =
-      NetVer.supportedNodeToNodeVersions (Proxy @Block.CardanoBlock)
+      NetVer.supportedNodeToNodeVersions (Proxy @Chain.CardanoBlock)
 
     -- Offer all supported protocol versions so the handshake negotiates the
     -- highest version both sides support. The remote node will raise a
@@ -415,6 +457,9 @@ connect
         [ mkChainSyncMiniProtocol myCodecs <$> clientChainSync clients
         , mkBlockFetchMiniProtocol myCodecs <$> clientBlockFetch clients
         , mkTxSubmissionMiniProtocol myCodecs tracers <$> clientTxSubmission clients
+#ifdef LEIOS_PROTOTYPE
+        , mkLeiosFetchMiniProtocol myCodecs <$> clientLeiosFetch clients
+#endif
         ])
       -- Warm protocols: none.
       (NetMux.WithWarm [])

@@ -70,7 +70,7 @@ import Ouroboros.Consensus.Block.Abstract qualified as Block
 import Ouroboros.Consensus.Node.NetworkProtocolVersion qualified as NetVer
 import Ouroboros.Consensus.Node.Run ()
 -- Orphan instances needed for
--- RunNode / SupportedNetworkProtocolVersion Block.CardanoBlock
+-- RunNode / SupportedNetworkProtocolVersion Chain.CardanoBlock
 import Ouroboros.Consensus.Shelley.Ledger.SupportsProtocol ()
 ---------------------------
 -- ouroboros-network:api --
@@ -97,7 +97,7 @@ import Cardano.Benchmarking.TxCentrifuge.NodeToClient.TxIdSync
   qualified as TxIdSync
 import Cardano.Benchmarking.TxCentrifuge.NodeToClient.TxSubmission
   qualified as TxSubmission
-import Cardano.Benchmarking.TxCentrifuge.Block qualified as Block
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
 import Cardano.Benchmarking.TxCentrifuge.Tracing qualified as Tracing
 
 --------------------------------------------------------------------------------
@@ -140,7 +140,7 @@ emptyClients = Clients
 -- returns successfully).
 connect
   :: IOManager.IOManager
-  -> Block.CodecConfig Block.CardanoBlock
+  -> Block.CodecConfig Chain.CardanoBlock
   -> Magic.NetworkMagic
   -> Tracing.Tracers
   -- | Path to the node's local Unix domain socket.
@@ -170,9 +170,9 @@ connect
     supportedVers
       :: Map.Map
            NetVer.NodeToClientVersion
-           (NetVer.BlockNodeToClientVersion Block.CardanoBlock)
+           (NetVer.BlockNodeToClientVersion Chain.CardanoBlock)
     supportedVers =
-      NetVer.supportedNodeToClientVersions (Proxy @Block.CardanoBlock)
+      NetVer.supportedNodeToClientVersions (Proxy @Chain.CardanoBlock)
 
     -- Offer all supported protocol versions so the handshake negotiates the
     -- highest version both sides support. The remote node will raise a
@@ -200,15 +200,15 @@ connect
             )
             -- Two codec options are available:
             -- * 'NetN2C.clientCodecs': ChainSync delivers deserialized blocks
-            --   ('Block.CardanoBlock'). The client can inspect block contents
+            --   ('Chain.CardanoBlock'). The client can inspect block contents
             --   directly (e.g. extract transaction IDs) at the cost of decoding
             --   every block on arrival.
             -- * 'NetN2C.defaultCodecs': ChainSync delivers serialised blocks
-            --   ('Serialised Block.CardanoBlock'). Blocks stay as raw CBOR
+            --   ('Serialised Chain.CardanoBlock'). Blocks stay as raw CBOR
             --   until explicitly decoded, deferring the CPU cost but requiring
             --   an extra deserialisation step before inspection.
             --
-            -- We use 'clientCodecs' because TxIdSync calls 'Block.extractTxIds'
+            -- We use 'clientCodecs' because TxIdSync calls 'Chain.extractTxKeys'
             -- on every block, which needs the deserialized body.
             (protocolBundle (NetN2C.clientCodecs codecConfig blkN2cVer n2cVer))
       | (n2cVer, blkN2cVer) <- Map.toList supportedVers
@@ -218,7 +218,7 @@ connect
     -- Protocols without a client in 'Clients' get a null\/idle peer that waits
     -- forever.
     protocolBundle
-      :: NetN2C.ClientCodecs Block.CardanoBlock IO
+      :: NetN2C.ClientCodecs Chain.CardanoBlock IO
       -> NtC.NodeToClientProtocols
            'Mux.InitiatorMode
            NtC.LocalAddress

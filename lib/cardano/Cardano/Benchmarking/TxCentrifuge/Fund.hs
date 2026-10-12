@@ -59,6 +59,7 @@ import Data.Text.Encoding qualified as T
 -------------------
 -- tx-centrifuge --
 -------------------
+import Cardano.Benchmarking.TxCentrifuge.Era (Era, era)
 import Cardano.Benchmarking.TxCentrifuge.NodeToClient.UTxOQuery qualified as UTxOQuery
 
 --------------------------------------------------------------------------------
@@ -386,7 +387,7 @@ discoverFundsAtAddresses
   -- | NodeToClient socket path of the local node to query.
   -> FilePath
   -- | Keys paired with the address each controls.
-  -> [(Api.SigningKey Api.PaymentKey, Api.AddressInEra Api.ConwayEra)]
+  -> [(Api.SigningKey Api.PaymentKey, Api.AddressInEra Era)]
   -> IO (Either String [Fund])
 discoverFundsAtAddresses networkId socketPath keyAddrs = do
   eUtxos <-
@@ -428,15 +429,14 @@ castToGenesisUTxOKey (Api.PaymentSigningKey skey) =
 deriveAddress
   :: Api.NetworkId
   -> Api.SigningKey Api.PaymentKey
-  -> Api.AddressInEra Api.ConwayEra
+  -> Api.AddressInEra Era
 deriveAddress networkId signingKey =
-  Api.shelleyAddressInEra
-    (Api.shelleyBasedEra @Api.ConwayEra) $
-  Api.makeShelleyAddress networkId
-    (Api.PaymentCredentialByKey
-      (Api.verificationKeyHash
-        (Api.getVerificationKey signingKey)))
-    Api.NoStakeAddress
+  Api.shelleyAddressInEra era $
+    Api.makeShelleyAddress networkId
+      (Api.PaymentCredentialByKey
+        (Api.verificationKeyHash
+          (Api.getVerificationKey signingKey)))
+      Api.NoStakeAddress
 
 -- | The signing key types accepted wherever a key is given, by path or inline.
 -- The names are the @\"type\"@ of the text envelope, exactly:

@@ -156,7 +156,8 @@ library cardano
   import:             project-config, ghc-warnings
   hs-source-dirs:     lib/cardano
   visibility:         public
-  exposed-modules:    Cardano.Benchmarking.TxCentrifuge.Block
+  exposed-modules:    Cardano.Benchmarking.TxCentrifuge.Chain
+                      Cardano.Benchmarking.TxCentrifuge.Era
                       Cardano.Benchmarking.TxCentrifuge.Fund
                       Cardano.Benchmarking.TxCentrifuge.NodeToClient
                       Cardano.Benchmarking.TxCentrifuge.NodeToClient.TxIdSync
@@ -173,8 +174,10 @@ library cardano
                     , base16-bytestring
                     , bytestring
                     , cardano-api
+                    , cardano-crypto-class
                     , cardano-diffusion
                     , cardano-ledger-api
+                    , cardano-ledger-binary
                     , cardano-ledger-core
                     , containers
                     , contra-tracer
@@ -193,6 +196,12 @@ library cardano
                     , stm <2.5.2 || >=2.5.3
                     , text
                     , time
+  -- The LeiosFetch protocol exists only in the "ouroboros-consensus" that the
+  -- "leios-prototype" branch pins, so this module is built only with the flag.
+  -- Its callers ("NodeToNode.hs" and "NodeToNode/TxIdSync.hs") reach it behind
+  -- LEIOS_PROTOTYPE conditionals, which keeps this module CPP free.
+  if flag(leios-prototype)
+    exposed-modules:  Cardano.Benchmarking.TxCentrifuge.NodeToNode.LeiosFetch
 
 --------------------------------------------------------------------------------
 
@@ -210,6 +219,7 @@ library cardano-tracing
   build-depends:      base >=4.12 && <5
                     , aeson
                     , cardano-api
+                    , cardano-crypto-class
                     , containers
                     -- Version 0.2.0.0 is excluded because it cannot be used:
                     -- its `Tracer` constructor no longer accepts a function and

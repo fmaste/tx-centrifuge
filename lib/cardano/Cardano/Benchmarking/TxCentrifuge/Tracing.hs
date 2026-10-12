@@ -61,6 +61,8 @@ import Ouroboros.Network.Protocol.TxSubmission2.Type qualified as STX
 -------------------
 -- tx-centrifuge --
 -------------------
+import Cardano.Benchmarking.TxCentrifuge.Chain qualified as Chain
+import Cardano.Benchmarking.TxCentrifuge.Era (Era)
 import Cardano.Benchmarking.TxCentrifuge.Fund qualified as Fund
 
 --------------------------------------------------------------------------------
@@ -146,11 +148,20 @@ nullTracers = Tracers
 -- transaction consumes existing UTxOs as /inputs/ and produces new UTxOs as
 -- /outputs/. Three types from @cardano-api@ identify these objects:
 --
--- === 'Api.TxId' — transaction identifier
+-- === 'Chain.TxId' — transaction identifier
 --
 -- A Blake2b-256 hash of the serialised transaction body ('Api.TxBody').
 -- Uniquely identifies a transaction on the blockchain. Rendered as a
--- 64-character hex string via 'Api.serialiseToRawBytesHexText'.
+-- 64-character hex string via 'Api.serialiseToRawBytesHexText'. It is
+-- @cardano-api@\'s @TxId@, re-exported by "Block" so that both of a
+-- transaction's identifiers come from the same module.
+--
+-- === 'Chain.TxHash' — the other hash that identifies a transaction
+--
+-- Blake2b-256 of the /whole serialised transaction/ rather than of its body.
+-- An endorser block lists these and no ids. Both are 64 hex characters, so
+-- only the field they are traced under tells them apart: the traces below use
+-- @txId@ and @txHash@ and never one for the other.
 --
 -- === 'Api.TxIx' — output index
 --
@@ -173,8 +184,12 @@ data BuilderTrace
     -- construction and nothing about the pipe or the queues (see 'PipeTrace').
     --
     -- * 'String': builder name (the workload name).
-    -- * 'Api.TxId': Blake2b-256 hash identifying the new transaction.
-    --   Obtain via @'Api.getTxId' ('Api.getTxBody' signedTx)@.
+    -- * 'Chain.TxKey': the transaction's identifiers as @buildTx@ derived
+    --   them, both at every detail level. The payload-side events carry the
+    --   same key but only at @DMaximum@ ('PipeTrace', 'RecyclerTrace'), and an
+    --   observer's key has both only when it read the transaction from a
+    --   ranking (Praos) block body: read from an endorser (Leios) block there
+    --   is no 'Chain.TxId' to report.
     -- * @['Api.AddressInEra']@: the destination addresses this transaction
     --   pays to, round-robin by output index (the builder's own addresses,
     --   from @destination_signing_key(s)@). Rendered as bech32 only at
@@ -186,7 +201,8 @@ data BuilderTrace
     --   fund's 'Fund.fundTxIn' is derived from the new 'Api.TxId' and a
     --   sequential 'Api.TxIx' index (0, 1, 2, ...).
     BuilderNewTx
-      !String !Api.TxId ![Api.AddressInEra Api.ConwayEra] [Fund.Fund] [Fund.Fund]
+      !String !Chain.TxKey
+      ![Api.AddressInEra Era] [Fund.Fund] [Fund.Fund]
   | -- | A dust batch was dropped: its total input value did not cover the fee,
     -- so @buildTx@ in "Cardano.Benchmarking.TxCentrifuge.TxAssembly" produced
     -- no valid change output. The inputs are abandoned (dropped from the
@@ -225,15 +241,17 @@ data PipeTrace
     -- @DMaximum@).
   | PipeInputsDequeued  !String !Natural [Fund.Fund]
     -- | A payload was added to the payload queue. 'Natural' is the
-    -- payload-queue depth right after the write. 'Api.TxId' is the payload's
-    -- tx id (emitted only at @DMaximum@).
-  | PipePayloadEnqueued !String !Natural !Api.TxId
+    -- payload-queue depth right after the write. The 'Chain.TxKey' is the
+    -- payload's own key, so both identifiers: an observer's report is matched
+    -- against it by the hash alone and need not carry the id (see
+    -- 'Chain.TxKey'). Emitted only at @DMaximum@.
+  | PipePayloadEnqueued !String !Natural !Chain.TxKey
     -- | A payload was removed from the payload queue (pulled by a worker).
     -- 'Natural' is the payload-queue depth observed shortly after the pull
     -- (this is read outside the pull transaction, so under concurrency it is a
-    -- close approximation, not an exact post-pull snapshot). 'Api.TxId' is the
-    -- payload's tx id (emitted only at @DMaximum@).
-  | PipePayloadDequeued !String !Natural !Api.TxId
+    -- close approximation, not an exact post-pull snapshot). The 'Chain.TxKey'
+    -- is the payload's key, as in 'PipePayloadEnqueued'.
+  | PipePayloadDequeued !String !Natural !Chain.TxKey
 
 --------------------------------------------------------------------------------
 -- Recycler trace messages
@@ -253,11 +271,12 @@ data PipeTrace
 data RecyclerTrace
   = -- | A payload's entry was added to the backlog: its key and its two
     -- input sets, held until a release picks one. 'String' is the recycler
-    -- name, 'Natural' the resulting backlog size, 'Api.TxId' the payload's
-    -- key, first @[Fund.Fund]@ the consumed inputs, second the produced
-    -- outputs (counts at @DDetailed@ and above, txId and full data
-    -- at @DMaximum@).
-    RecyclerAddToBacklog !String !Natural !Api.TxId [Fund.Fund] [Fund.Fund]
+    -- name, 'Natural' the resulting backlog size, the 'Chain.TxKey' the
+    -- payload's key, first @[Fund.Fund]@ the consumed inputs,
+    -- second the produced outputs (counts at @DDetailed@ and above, key and
+    -- full data at @DMaximum@).
+    RecyclerAddToBacklog
+      !String !Natural !Chain.TxKey [Fund.Fund] [Fund.Fund]
     -- | Recycled inputs were added back onto a pipe's input queue. First
     -- 'String' is the recycler name, second 'String' the input queue, 'Natural'
     -- the resulting backlog size, @[Fund.Fund]@ the added inputs (count at
@@ -268,11 +287,12 @@ data RecyclerTrace
     -- queue, and the input queue was reseeded with fresh inputs (a builder's
     -- recovery). First 'String' is the recycler name, second 'String' the
     -- input queue, 'Natural' the resulting backlog size (always @0@, a reset
-    -- clears the backlog), @[Api.TxId]@ the dropped queued payloads by txId,
+    -- clears the backlog), the third list the dropped queued payloads by key,
     -- first @[Fund.Fund]@ the dropped inputs, second the fresh ones added to
     -- the queue (counts at @DDetailed@ and above, full data at
     -- @DMaximum@).
-  | RecyclerReset     !String !String !Natural [Api.TxId] [Fund.Fund] [Fund.Fund]
+  | RecyclerReset
+      !String !String !Natural [Chain.TxKey] [Fund.Fund] [Fund.Fund]
 
 --------------------------------------------------------------------------------
 -- Observer trace messages
@@ -284,9 +304,10 @@ data ObserverTrace
   = -- | The observer saw a transaction confirmed or orphaned (rolled back).
     --
     -- * 'String': observer name (from the config's @\"observers\"@ object).
-    -- * 'Api.TxId': the confirmed/orphaned transaction's id.
+    -- * 'Chain.TxKey': the confirmed/orphaned transaction, by the identifier
+    --   the observer read.
     -- * 'Bool': @True@ if orphaned (rolled back), @False@ if confirmed.
-    ObserverAnnounce !String !Api.TxId !Bool
+    ObserverAnnounce !String !Chain.TxKey !Bool
 
 --------------------------------------------------------------------------------
 -- TxSubmission trace messages
@@ -302,29 +323,32 @@ data ObserverTrace
 data TxSubmission
   = -- | The node asked for transaction identifiers (@MsgRequestTxIds@).
     --
-    -- * 'String':               target node name.
-    -- * @['Api.TxId']@:         TxIds we have not yet received an ACK for.
-    -- * 'Int':                  number of TxIds the node is acknowledging (ACK).
-    -- * 'Int':                  number of new TxIds the node is requesting (REQ).
-    RequestTxIds !String [Api.TxId] !Int !Int
+    -- * 'String':                 target node name.
+    -- * @['Chain.TxId']@:         TxIds we have not yet received an ACK for.
+    -- * 'Int':                    TxIds the node is acknowledging (ACK).
+    -- * 'Int':                    new TxIds the node is requesting (REQ).
+    RequestTxIds !String [Chain.TxId] !Int !Int
     -- | We replied to @MsgRequestTxIds@ with TxId\/size pairs.
     --
-    -- * 'String':               target node name.
-    -- * 'Int':                  number of TxIds the node is acknowledging (ACK).
-    -- * 'Int':                  number of new TxIds the node is requesting (REQ).
-    -- * @['Api.TxId']@:         updated unacked TxIds (after ACK + new announcements).
-    -- * @[('Api.TxId','Int')]@: TxIds we announced in this reply with its sizes in bytes.
-  | ReplyTxIds   !String !Int !Int [Api.TxId] [(Api.TxId,Int)]
+    -- * 'String':                 target node name.
+    -- * 'Int':                    TxIds the node is acknowledging (ACK).
+    -- * 'Int':                    new TxIds the node is requesting (REQ).
+    -- * @['Chain.TxId']@:         updated unacked TxIds (after ACK and the
+    --                             new announcements).
+    -- * @[('Chain.TxId','Int')]@: TxIds we announced in this reply, with
+    --                             their sizes in bytes.
+  | ReplyTxIds   !String !Int !Int [Chain.TxId] [(Chain.TxId,Int)]
     -- | The node asked for full transactions by TxId (@MsgRequestTxs@).
     --
-    -- * 'String':               target node name.
-    -- * @['Api.TxId']@:         TxIds the node requested.
-  | RequestTxs   !String [Api.TxId]
+    -- * 'String':                 target node name.
+    -- * @['Chain.TxId']@:         TxIds the node requested.
+  | RequestTxs   !String [Chain.TxId]
     -- | We replied to @MsgRequestTxs@ with the requested transactions.
     --
-    -- * 'String':               target node name.
-    -- * @['Api.TxId']@:         TxIds the node requested.
-    -- * @[('Api.TxId','Int')]@: TxIds we actually sent (subset of requested; a
-    --                           TxId is missing if it wasn't in the unacked list).
-  | ReplyTxs     !String [Api.TxId] [(Api.TxId,Int)]
+    -- * 'String':                 target node name.
+    -- * @['Chain.TxId']@:         TxIds the node requested.
+    -- * @[('Chain.TxId','Int')]@: TxIds we actually sent (subset of requested;
+    --                             a TxId is missing if it wasn't in the
+    --                             unacked list).
+  | ReplyTxs     !String [Chain.TxId] [(Chain.TxId,Int)]
 

@@ -42,6 +42,10 @@ import Cardano.Ledger.Coin qualified as L
 -- containers --
 ----------------
 import Data.Map.Strict qualified as Map
+-------------------
+-- tx-centrifuge --
+-------------------
+import Cardano.Benchmarking.TxCentrifuge.Era (Era)
 
 --------------------------------------------------------------------------------
 
@@ -52,16 +56,16 @@ import Data.Map.Strict qualified as Map
 -- failure: the socket is unreachable, the acquire fails, or the node reports an
 -- era mismatch.
 --
--- The input addresses are 'Api.ConwayEra'-typed for the caller's convenience
+-- The input addresses are 'Era'-typed for the caller's convenience
 -- (the on-the-wire bytes are era-agnostic across Shelley-based eras). The query
 -- itself runs in whatever era the node reports.
 queryUTxOsAtAddresses
   :: FilePath
   -- ^ NodeToClient socket path of the local node to query.
   -> Api.NetworkId
-  -> [Api.AddressInEra Api.ConwayEra]
+  -> [Api.AddressInEra Era]
   -> IO (Either String
-          (Map.Map (Api.AddressInEra Api.ConwayEra) [(Api.TxIn, Integer)])
+          (Map.Map (Api.AddressInEra Era) [(Api.TxIn, Integer)])
         )
 queryUTxOsAtAddresses socketPath networkId addrs = do
   let connectInfo = Api.LocalNodeConnectInfo
@@ -89,9 +93,9 @@ queryUTxOsAtAddresses socketPath networkId addrs = do
 -- | Detect the node's current era, then run the UTxO query in that era.
 runQuery
   :: Api.LocalNodeConnectInfo
-  -> Map.Map Api.AddressAny (Api.AddressInEra Api.ConwayEra)
+  -> Map.Map Api.AddressAny (Api.AddressInEra Era)
   -> IO (Either String
-           (Map.Map (Api.AddressInEra Api.ConwayEra) [(Api.TxIn, Integer)])
+           (Map.Map (Api.AddressInEra Era) [(Api.TxIn, Integer)])
         )
 runQuery connectInfo inputByAny = do
   eEra <- Api.runExceptT $
@@ -115,9 +119,9 @@ queryShelleyEra
   :: forall era
    . Api.LocalNodeConnectInfo
   -> Api.ShelleyBasedEra era
-  -> Map.Map Api.AddressAny (Api.AddressInEra Api.ConwayEra)
+  -> Map.Map Api.AddressAny (Api.AddressInEra Era)
   -> IO (Either String
-          (Map.Map (Api.AddressInEra Api.ConwayEra) [(Api.TxIn, Integer)])
+          (Map.Map (Api.AddressInEra Era) [(Api.TxIn, Integer)])
         )
 queryShelleyEra connectInfo sbe inputByAny = do
   let query :: Api.QueryInMode (Either Api.EraMismatch (Api.UTxO era))
@@ -138,13 +142,13 @@ queryShelleyEra connectInfo sbe inputByAny = do
 
 -- | Group the node's @TxIn -> TxOut@ UTxO map by the caller's input address,
 -- projecting each 'Api.TxOut' to its 'Api.AddressAny' and looking that up in
--- the reverse index to recover the 'Api.ConwayEra' address the caller passed.
+-- the reverse index to recover the 'Era' address the caller passed.
 -- A UTxO whose address is not in the index is dropped (cannot happen for a
 -- by-address query, but keeps the fold total).
 groupByAddress
-  :: Map.Map Api.AddressAny (Api.AddressInEra Api.ConwayEra)
+  :: Map.Map Api.AddressAny (Api.AddressInEra Era)
   -> Map.Map Api.TxIn (Api.TxOut Api.CtxUTxO era)
-  -> Map.Map (Api.AddressInEra Api.ConwayEra) [(Api.TxIn, Integer)]
+  -> Map.Map (Api.AddressInEra Era) [(Api.TxIn, Integer)]
 groupByAddress inputByAny = Map.foldlWithKey' step Map.empty
   where
     step acc txin (Api.TxOut addr val _datum _refScript) =
@@ -156,7 +160,7 @@ groupByAddress inputByAny = Map.foldlWithKey' step Map.empty
 
 -- | Erase the era index of an 'Api.AddressInEra', giving the era-agnostic
 -- 'Api.AddressAny'. Used internally to join the node's query-era reply back to
--- the caller's 'Api.ConwayEra' input addresses (the on-the-wire bytes match
+-- the caller's 'Era' input addresses (the on-the-wire bytes match
 -- across Shelley-based eras, so the projection is a stable join key).
 addressInEraToAny :: Api.AddressInEra era -> Api.AddressAny
 addressInEraToAny (Api.AddressInEra _ addr) = Api.toAddressAny addr
