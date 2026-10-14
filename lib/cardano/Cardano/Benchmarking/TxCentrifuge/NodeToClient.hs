@@ -208,7 +208,7 @@ connect
             --   until explicitly decoded, deferring the CPU cost but requiring
             --   an extra deserialisation step before inspection.
             --
-            -- We use 'clientCodecs' because TxIdSync calls 'Chain.extractTxKeys'
+            -- We use 'clientCodecs' because TxIdSync calls 'Chain.extractTxRefs'
             -- on every block, which needs the deserialized body.
             (protocolBundle (NetN2C.clientCodecs codecConfig blkN2cVer n2cVer))
       | (n2cVer, blkN2cVer) <- Map.toList supportedVers

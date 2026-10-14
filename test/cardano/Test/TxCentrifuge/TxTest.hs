@@ -62,14 +62,14 @@ txTests = Tasty.testGroup "node"
       case TxAssembly.buildTx era [(signKey, addr)] [fund] 1 fee of
         Left err ->
           HUnit.assertFailure $ "buildTx failed: " ++ show err
-        Right (tx, txKey, outFunds) -> do
+        Right (tx, txRef, outFunds) -> do
           -- One output fund recycled.
           length outFunds @?= 1
           -- The key's id is the body's, derived here independently.
-          Chain.txKeyId txKey @?= Just (Api.getTxId (Api.getTxBody tx))
+          Chain.txRefId txRef @?= Just (Api.getTxId (Api.getTxBody tx))
           -- The key's hash is of the signed transaction's bytes, which is what
           -- an endorser block lists, not of its body.
-          Chain.txKeyHash txKey @?= Chain.hashTxBytes (Api.serialiseToCBOR tx)
+          Chain.txRefHash txRef @?= Chain.hashTxBytes (Api.serialiseToCBOR tx)
           -- Output value = input - fee.
           Fund.fundLovelace (head outFunds) @?= (10_000_000 - 200_000)
           -- The recycled fund's TxIn references the new tx.
@@ -85,7 +85,7 @@ txTests = Tasty.testGroup "node"
              [fund1, fund2] 3 fee of
         Left err ->
           HUnit.assertFailure $ "buildTx failed: " ++ show err
-        Right (_tx, _txKey, outFunds) -> do
+        Right (_tx, _txRef, outFunds) -> do
           -- Three output funds.
           length outFunds @?= 3
           -- Total output = total input - fee.

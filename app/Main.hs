@@ -241,19 +241,19 @@ main = do
               die $ "TxAssembly.buildTx: invalid builder parameters: " ++ reason
             Left (TxAssembly.LedgerFailure reason) ->
               die $ "TxAssembly.buildTx: ledger construction failed: " ++ reason
-            Right (tx, txKey, outputFunds) -> do
+            Right (tx, txRef, outputFunds) -> do
               -- Trace the newly built transaction
               -- (TxCentrifuge.Builder.NewTx), purely a construction event, no
               -- pipe/queue info.
               Tracing.traceWith
                 (Tracing.trBuilder tracers)
                 (Tracing.BuilderNewTx
-                  builderName txKey
+                  builderName txRef
                   -- The destination addresses.
                   (map snd (destinations builder))
                   inputFunds outputFunds
                 )
-              Runtime.baAddPayload api txKey tx inputFunds outputFunds
+              Runtime.baAddPayload api txRef tx inputFunds outputFunds
 
   -- Pipe-events factory passed to 'Runtime.resolve'. Returns a 'PipeHandle'
   -- Given builder's zero-based index, builder name and input queue name create
@@ -269,12 +269,12 @@ main = do
           , Runtime.phOnInputsDequeued = \inputs depth ->
               Tracing.traceWith (Tracing.trPipe tracers)
                 (Tracing.PipeInputsDequeued inputQueueName depth inputs)
-          , Runtime.phOnPayloadEnqueued = \txKey depth ->
+          , Runtime.phOnPayloadEnqueued = \txRef depth ->
               Tracing.traceWith (Tracing.trPipe tracers)
-                (Tracing.PipePayloadEnqueued builderName depth txKey)
-          , Runtime.phOnPayloadDequeued = \txKey depth ->
+                (Tracing.PipePayloadEnqueued builderName depth txRef)
+          , Runtime.phOnPayloadDequeued = \txRef depth ->
               Tracing.traceWith (Tracing.trPipe tracers)
-                (Tracing.PipePayloadDequeued builderName depth txKey)
+                (Tracing.PipePayloadDequeued builderName depth txRef)
           }
 
   -- Recovery factory used by 'mkRecyclerHandle'. When the workload's builder
@@ -349,24 +349,36 @@ main = do
   -- Recycler-events factory passed to 'Runtime.resolve'. Returns a
   -- 'RecyclerHandle'. Given the builder's zero-based index and name and the
   -- name of the input queue it recycles into, creates the handlers that trace
-  -- when a payload enters the backlog (TxCentrifuge.Recycler.AddToBacklog),
-  -- when its inputs are added to the pipe (TxCentrifuge.Recycler.AddToPipe),
-  -- and the optional recovery action (see 'mkRecover'). The recycler is named
+  -- when a payload enters the backlog (TxCentrifuge.Recycler.Backlog.Held),
+  -- when it leaves it (TxCentrifuge.Recycler.Backlog.Released.*), and the
+  -- optional recovery action (see 'mkRecover'). The recycler is named
   -- by the workload (one per workload) and the pipe by that input queue, the
   -- same split 'mkPipeHandle' makes, so one enqueue is reported under one name
   -- by both TxCentrifuge.Pipe.InputsEnqueued and this.
   let mkRecyclerHandle recyclerIndex builderName inputQueueName = do
         recover <- mkRecover recyclerIndex builderName
         pure Runtime.RecyclerHandle
-          { Runtime.rhOnAddToBacklog = \txKey consumed outputs backlog ->
+          { Runtime.rhOnHold = \txRef consumed outputs backlog ->
               Tracing.traceWith (Tracing.trRecycler tracers)
-                (Tracing.RecyclerAddToBacklog
-                  builderName backlog txKey consumed outputs)
-          , Runtime.rhOnAddToPipe = \txKey inputs backlog ->
-              Tracing.traceWith (Tracing.trRecycler tracers)
-                (Tracing.RecyclerAddToPipe
-                  builderName inputQueueName backlog txKey inputs
-                )
+                (Tracing.RecyclerHeld
+                  builderName backlog txRef consumed outputs)
+            -- Why the payload was released, read off the event: the recycler
+            -- says which set went back, never why. Only an on_confirm orphan
+            -- returns the consumed inputs ('Left'), and only a ref an observer
+            -- read off the chain carries a block, which on_build and on_pull
+            -- never have.
+          , Runtime.rhOnRelease = \txRef released backlog ->
+              Tracing.traceWith (Tracing.trRecycler tracers) $
+                case (released, Chain.txRefBlock txRef) of
+                  (Left consumed, _) ->
+                    Tracing.RecyclerReleasedOrphaned
+                      builderName inputQueueName backlog txRef consumed
+                  (Right outputs, Just _) ->
+                    Tracing.RecyclerReleasedConfirmed
+                      builderName inputQueueName backlog txRef outputs
+                  (Right outputs, Nothing) ->
+                    Tracing.RecyclerReleasedOptimistic
+                      builderName inputQueueName backlog txRef outputs
             -- The trace keeps the dropped payloads by key, not the full
             -- transactions.
           , Runtime.rhOnReset = \droppedInputs droppedPayloads fresh backlog ->
@@ -391,25 +403,25 @@ main = do
         -- confirmed/orphaned tx (TxCentrifuge.Observer.Announce.{Confirmed,
         -- Orphaned}), decoupled from the pipe and recycling. Runs alongside the
         -- connection in 'ohRun'.
-        -- TODO: this is all-chain — it logs every confirmed tx the observer sees
-        -- on the chain, not just this generator's transactions (the broadcast is
-        -- unfiltered). Filter to our own txIds once Main tracks its in-flight set.
+        -- Announce is the whole chain: one line per transaction in every
+        -- block this observer sees, so with one observer per node the volume
+        -- is the chain's throughput times the observers.
+        -- TxCentrifuge.Recycler.Backlog.Released.* is the same events filtered
+        -- to ours, a release happening only for a ref that recycler's backlog
+        -- held, and it carries the block as well. So keep Announce for what
+        -- only it shows, which observer saw a transaction and when, and
+        -- silence it otherwise.
         let announceLoop broadcast = do
               chan <- STM.atomically $ STM.dupTChan broadcast
               forever $ do
-                eitherBlockTx <- STM.atomically $ STM.readTChan chan
+                eitherTxRef <- STM.atomically $ STM.readTChan chan
                 -- The broadcast says which: 'Left' orphaned, 'Right'
-                -- confirmed, and each is its own namespace.
+                -- confirmed, and each is its own namespace. The key carries
+                -- the block it was read in, so nothing else is needed here.
                 Tracing.traceWith (Tracing.trObserver tracers) $
-                  case eitherBlockTx of
-                    Left  blockTx -> Tracing.ObserverOrphaned  observerName
-                                       (Chain.blockTxKey     blockTx)
-                                       (Chain.blockTxBlockNo blockTx)
-                                       (Chain.blockTxSlotNo  blockTx)
-                    Right blockTx -> Tracing.ObserverConfirmed observerName
-                                       (Chain.blockTxKey     blockTx)
-                                       (Chain.blockTxBlockNo blockTx)
-                                       (Chain.blockTxSlotNo  blockTx)
+                  case eitherTxRef of
+                    Left  txRef -> Tracing.ObserverOrphaned  observerName txRef
+                    Right txRef -> Tracing.ObserverConfirmed observerName txRef
         case observer of
           -- N2N: ChainSync (headers) + BlockFetch (blocks) + KeepAlive.
           --------------------------------------------------------------
@@ -452,22 +464,12 @@ main = do
               , Runtime.ohSubscribe = do
                   chan <- STM.atomically $
                     STM.dupTChan (TxIdSyncN2N.stateBroadcast syncState)
-                  -- Reduce each broadcast BlockTx to its key, the identifier
-                  -- the observer read (see 'Chain.BlockTx').
-                  -- TODO: own-traffic filter. This adapter is where a future
-                  -- filter should drop foreign events (txIds this generator
-                  -- never built) before any forwarder, recovery query or reset
-                  -- sees them: an in-flight txId set filled at build time and
-                  -- pruned at confirm/orphan. Whether it lives here or as a
-                  -- generic facility in pull-fiction is an open decision. Until
-                  -- then, keyed resets (on_confirm) are gated by the recycler's
-                  -- backlog and the optimistic strategies reset on any settled
-                  -- orphan.
-                  pure $ do
-                    eitherBlockTx <- STM.readTChan chan
-                    pure $ case eitherBlockTx of
-                      Left  blockTx -> Left  (Chain.blockTxKey blockTx)
-                      Right blockTx -> Right (Chain.blockTxKey blockTx)
+                  -- The broadcast is already refs, each carrying what the
+                  -- observer read of it (see 'Chain.TxRef'), so the recycler
+                  -- gets the event unchanged. Foreign transactions reach it
+                  -- too: its backlog lookup drops them, which is why no
+                  -- filter sits here.
+                  pure (STM.readTChan chan)
               }
           -- N2C: LocalChainSync (full blocks, no BlockFetch needed).
           -----------------------------------------------------------
@@ -496,15 +498,9 @@ main = do
               , Runtime.ohSubscribe = do
                   chan <- STM.atomically $
                     STM.dupTChan (TxIdSyncN2C.stateBroadcast syncState)
-                  -- Reduce each broadcast BlockTx to its key, the identifier
-                  -- the observer read (see 'Chain.BlockTx').
-                  -- TODO: own-traffic filter, same spot as the N2N adapter
-                  -- above (see the note there).
-                  pure $ do
-                    eitherBlockTx <- STM.readTChan chan
-                    pure $ case eitherBlockTx of
-                      Left  blockTx -> Left  (Chain.blockTxKey blockTx)
-                      Right blockTx -> Right (Chain.blockTxKey blockTx)
+                  -- Already refs, handed over unchanged, as in the N2N
+                  -- adapter above.
+                  pure (STM.readTChan chan)
               }
 
   -- The 'TargetWorker' callback (the last caller-supplied handler): run once

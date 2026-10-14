@@ -79,8 +79,8 @@ data Tracers = Tracers
     -- | Pipe trace: payload/input queue add and remove events, with the
     -- relevant queue depth. Purely about queue mechanics.
   , trPipe :: !(Tracer IO PipeTrace)
-    -- | Recycler trace: payloads added to the backlog ('AddToBacklog'),
-    -- recycled inputs added back onto a pipe's input queue ('AddToPipe') and
+    -- | Recycler trace: payloads entering the backlog ('RecyclerHeld'),
+    -- recycled inputs added back onto a pipe's input queue (the releases) and
     -- input queue resets ('Reset'). Every event emits the recycler's name,
     -- then the backlog size ('backlog') and the counts from DNormal, and the
     -- payload key and the fund arrays from DDetailed.
@@ -184,7 +184,7 @@ data BuilderTrace
     -- construction and nothing about the pipe or the queues (see 'PipeTrace').
     --
     -- * 'String': builder name (the workload name).
-    -- * 'Chain.TxKey': the transaction's identifiers as @buildTx@ derived
+    -- * 'Chain.TxRef': the transaction's identifiers as @buildTx@ derived
     --   them, from @DNormal@ (@DMinimal@ is the builder name alone). The payload-side events carry the
     --   same key but only at @DMaximum@ ('PipeTrace', 'RecyclerTrace'), and an
     --   observer's key has both only when it read the transaction from a
@@ -201,7 +201,7 @@ data BuilderTrace
     --   fund's 'Fund.fundTxIn' is derived from the new 'Api.TxId' and a
     --   sequential 'Api.TxIx' index (0, 1, 2, ...).
     BuilderNewTx
-      !String !Chain.TxKey
+      !String !Chain.TxRef
       ![Api.AddressInEra Era] [Fund.Fund] [Fund.Fund]
   | -- | A dust batch was dropped: its total input value did not cover the fee,
     -- so @buildTx@ in "Cardano.Benchmarking.TxCentrifuge.TxAssembly" produced
@@ -241,55 +241,79 @@ data PipeTrace
     -- itself from @DDetailed@).
   | PipeInputsDequeued  !String !Natural [Fund.Fund]
     -- | A payload was added to the payload queue. 'Natural' is the
-    -- payload-queue depth right after the write. The 'Chain.TxKey' is the
+    -- payload-queue depth right after the write. The 'Chain.TxRef' is the
     -- payload's own key, so both identifiers: an observer's report is matched
     -- against it by the hash alone and need not carry the id (see
-    -- 'Chain.TxKey'). Emitted from @DDetailed@, the level at which the input
+    -- 'Chain.TxRef'). Emitted from @DDetailed@, the level at which the input
     -- events name their funds.
-  | PipePayloadEnqueued !String !Natural !Chain.TxKey
+  | PipePayloadEnqueued !String !Natural !Chain.TxRef
     -- | A payload was removed from the payload queue (pulled by a worker).
     -- 'Natural' is the payload-queue depth observed shortly after the pull
     -- (this is read outside the pull transaction, so under concurrency it is a
-    -- close approximation, not an exact post-pull snapshot). The 'Chain.TxKey'
+    -- close approximation, not an exact post-pull snapshot). The 'Chain.TxRef'
     -- is the payload's key, as in 'PipePayloadEnqueued'.
-  | PipePayloadDequeued !String !Natural !Chain.TxKey
+  | PipePayloadDequeued !String !Natural !Chain.TxRef
 
 --------------------------------------------------------------------------------
 -- Recycler trace messages
 --------------------------------------------------------------------------------
 
--- | Recycler events. The recycler holds a payload's recyclable input UTxOs
--- until a release picks a set, then adds it back onto a pipe's input queue
--- (closing the loop). It reports each add of a payload's entry to its
--- backlog ('RecyclerAddToBacklog': the key and both input sets), each add of
--- inputs to a pipe ('RecyclerAddToPipe': which payload was released and which
--- inputs that added, by which recycler, into which queue) and each reset of a
--- pipe ('RecyclerReset'). The
--- 'String' names are the recycler and (on 'RecyclerAddToPipe' and
--- 'RecyclerReset') the input queue it recycles into, which is why they are
--- recorded separately: one recycler per workload, but the input queue can be
--- shared (see 'PipeTrace' for the names and @\"initial_inputs\"@ @\"scope\"@
--- for the scope). The 'Natural' is the resulting backlog size.
+-- | Recycler events: an entry entering the backlog, the three ways one leaves
+-- it, and a reset.
+--
+-- The recycler holds a payload's recyclable input UTxOs until a release picks
+-- a set, then adds it back onto a pipe's input queue (closing the loop). An
+-- entry enters at 'RecyclerHeld' and leaves at one of the releases, which name
+-- why it left:
+--
+-- * 'RecyclerReleasedConfirmed': the chain confirmed the transaction. Its key
+--   carries the block it was read in ('Chain.txRefBlock').
+-- * 'RecyclerReleasedOrphaned': its block was rolled back, so the consumed
+--   inputs went back instead of the outputs. Only an @on_confirm@ workload
+--   releases that set, which is how this is told apart.
+-- * 'RecyclerReleasedOptimistic': no chain verdict was involved, which is
+--   @on_build@ and @on_pull@. There is no block to report.
+--
+-- Every release is for a key the backlog held, so these are this generator's
+-- own transactions, where 'ObserverTrace' reports the whole chain.
+--
+-- The 'String' names are the recycler and (everywhere but 'RecyclerHeld') the
+-- input queue it recycles into, which is why they are recorded separately: one
+-- recycler per workload, but the input queue can be shared (see 'PipeTrace'
+-- for the names and @\"initial_inputs\"@ @\"scope\"@ for the scope). The
+-- 'Natural' is the resulting backlog size.
 data RecyclerTrace
   = -- | A payload's entry was added to the backlog: its key and its two
     -- input sets, held until a release picks one. 'String' is the recycler
-    -- name, 'Natural' the resulting backlog size, the 'Chain.TxKey' the
+    -- name, 'Natural' the resulting backlog size, the 'Chain.TxRef' the
     -- payload's key, first @[Fund.Fund]@ the consumed inputs, second the
     -- produced outputs (counts from @DNormal@, the key and the fund arrays
     -- from @DDetailed@).
-    RecyclerAddToBacklog
-      !String !Natural !Chain.TxKey [Fund.Fund] [Fund.Fund]
-    -- | A held payload was released: its recycled inputs went back onto a
-    -- pipe's input queue. First 'String' is the recycler name, second 'String'
-    -- the input queue, 'Natural' the resulting backlog size, the 'Chain.TxKey'
-    -- the released payload's key, @[Fund.Fund]@ the added inputs (count from
-    -- @DNormal@, the key and the fund array from @DDetailed@).
+    RecyclerHeld
+      !String !Natural !Chain.TxRef [Fund.Fund] [Fund.Fund]
+    -- | A held payload was released because the chain confirmed it: its
+    -- produced outputs went back onto a pipe's input queue. First 'String' is
+    -- the recycler name, second 'String' the input queue, 'Natural' the
+    -- resulting backlog size, the 'Chain.TxRef' the released payload's key,
+    -- @[Fund.Fund]@ the added inputs (count from @DNormal@, the key and the
+    -- fund array from @DDetailed@).
     --
-    -- The key is the one 'RecyclerAddToBacklog' carried for that payload, so
-    -- the two pair up: how long it waited for its confirmation is the time
-    -- between them.
-  | RecyclerAddToPipe
-      !String !String !Natural !Chain.TxKey [Fund.Fund]
+    -- The key is the one the observer read, so it carries the block the
+    -- transaction was confirmed in, and it equals the key 'RecyclerHeld'
+    -- carried for that payload: the wait is the time between the two.
+  | RecyclerReleasedConfirmed
+      !String !String !Natural !Chain.TxRef [Fund.Fund]
+    -- | A held payload was released because its block was rolled back: its
+    -- consumed inputs went back instead of its outputs. Fields as in
+    -- 'RecyclerReleasedConfirmed', and the key carries the rolled-back block.
+  | RecyclerReleasedOrphaned
+      !String !String !Natural !Chain.TxRef [Fund.Fund]
+    -- | A held payload was released with no chain verdict involved, which is
+    -- @on_build@ (at build) and @on_pull@ (at dequeue): its outputs went back
+    -- straight away. Fields as in 'RecyclerReleasedConfirmed', except that the
+    -- key has no block, nothing having seen the transaction on the chain.
+  | RecyclerReleasedOptimistic
+      !String !String !Natural !Chain.TxRef [Fund.Fund]
     -- | The recycler reset a pipe's input queue: the queued inputs were
     -- discarded, the payloads built from them were dropped from the payload
     -- queue, and the input queue was reseeded with fresh inputs (a builder's
@@ -299,7 +323,7 @@ data RecyclerTrace
     -- first @[Fund.Fund]@ the dropped inputs, second the fresh ones added to
     -- the queue (counts from @DNormal@, the arrays from @DDetailed@).
   | RecyclerReset
-      !String !String !Natural [Chain.TxKey] [Fund.Fund] [Fund.Fund]
+      !String !String !Natural [Chain.TxRef] [Fund.Fund] [Fund.Fund]
 
 --------------------------------------------------------------------------------
 -- Observer trace messages
@@ -316,21 +340,20 @@ data ObserverTrace
   = -- | The observer saw a transaction confirmed.
     --
     -- * 'String': observer name (from the config's @\"observers\"@ object).
-    -- * 'Chain.TxKey': the transaction, by the identifier the observer read,
-    --   from @DNormal@ (@DMinimal@ is the observer name alone).
-    -- * 'Chain.BlockNo' and 'Chain.SlotNo': where on the chain it was seen,
-    --   from @DDetailed@. Always a ranking block's, and for a transaction that
-    --   came from an endorser block the /certifying/ block's, since that is
-    --   where an EB's transactions enter the chain.
-    ObserverConfirmed !String !Chain.TxKey !Chain.BlockNo !Chain.SlotNo
+    -- * 'Chain.TxRef': the transaction, by the identifier the observer read,
+    --   from @DNormal@ (@DMinimal@ is the observer name alone). Its
+    --   'Chain.txRefBlock' is where on the chain it was seen, reported from
+    --   @DDetailed@: always a ranking block's, and for a transaction that came
+    --   from an endorser block the /certifying/ block's, since that is where
+    --   an EB's transactions enter the chain.
+    ObserverConfirmed !String !Chain.TxRef
   | -- | The observer saw a transaction orphaned: it was in a block that was
     -- rolled back and did not reappear within the confirmation window.
     --
     -- * 'String': observer name.
-    -- * 'Chain.TxKey': the transaction, as in 'ObserverConfirmed'.
-    -- * 'Chain.BlockNo' and 'Chain.SlotNo': the block it had been seen in,
-    --   the one that was rolled back, as in 'ObserverConfirmed'.
-    ObserverOrphaned !String !Chain.TxKey !Chain.BlockNo !Chain.SlotNo
+    -- * 'Chain.TxRef': the transaction, as in 'ObserverConfirmed', whose block
+    --   is the rolled-back one.
+    ObserverOrphaned !String !Chain.TxRef
 
 --------------------------------------------------------------------------------
 -- TxSubmission trace messages

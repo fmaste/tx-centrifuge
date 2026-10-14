@@ -129,10 +129,10 @@ resolveConfig path inputs = do
       })
     -- mkRecyclerHandle: no-op recycle handler.
     (\_ _ _ -> pure Runtime.RecyclerHandle
-      { Runtime.rhOnAddToBacklog = \_ _ _ _ -> pure ()
-      , Runtime.rhOnAddToPipe    = \_ _ _ -> pure ()
-      , Runtime.rhOnReset        = \_ _ _ _ -> pure ()
-      , Runtime.rhRecover        = Nothing
+      { Runtime.rhOnHold    = \_ _ _ _ -> pure ()
+      , Runtime.rhOnRelease = \_ _ _ -> pure ()
+      , Runtime.rhOnReset   = \_ _ _ _ -> pure ()
+      , Runtime.rhRecover   = Nothing
       })
     -- mkObserver: no test config uses observers.
     (\_ name _ -> fail $ "resolveConfig: unexpected observer: " ++ name)

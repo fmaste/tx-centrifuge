@@ -8,7 +8,7 @@
 -- it through four axiomatic actions, each firing (fire-and-forget) the
 -- same-named 'PayloadLifecycle' instruction onto the recycler's queue:
 --
---   * 'addToBacklog':    add a payload's two input sets, the /consumed/ inputs
+--   * 'hold':            add a payload's two input sets, the /consumed/ inputs
 --                        and the produced /outputs/, to the backlog.
 --   * 'releaseOutputs':  release the held outputs to the input queue.
 --                        Reason-free: the caller decides when a payload counts
@@ -32,10 +32,10 @@
 -- each write atomic.
 --
 -- The worker emits one observable event per action family for tracing:
--- /AddToBacklog/ each time it adds a payload's entry to the backlog
--- ('addToBacklog'), /AddToPipe/ each time a release adds recycled inputs to the
--- pipe (via 'Pipe.addInputs') and /Reset/ each time a reset drops the queued
--- inputs and payloads and reseeds the input queue.
+-- /Hold/ each time it adds a payload's entry to the backlog ('hold'), /Release/
+-- each time a release adds recycled inputs to the pipe (via 'Pipe.addInputs')
+-- and /Reset/ each time a reset drops the queued inputs and payloads and
+-- reseeds the input queue.
 --
 -- INVARIANT: each in-flight payload must have a unique @key@. The map is keyed
 -- by @key@, so two live payloads sharing a key would clobber each other's held
@@ -43,27 +43,27 @@
 -- txId (distinct inputs imply distinct txId, and the closed loop only reuses a
 -- key after the previous payload under it was recycled).
 --
--- INVARIANT: a payload's 'addToBacklog' must be enqueued before any of its
--- releases, which the callers guarantee ('baAddPayload' holds before the
--- payload becomes dequeuable, and an observer can only see a submitted
--- payload). The worker therefore IGNORES a release for an unknown key: it is
--- foreign (the observer broadcast is unfiltered), a duplicate (a second
--- subscription), or already released. A keyed reset ('reset' with 'Just') obeys
--- the same rule: for an unknown key NO reset happens, the event is ignored. (To
--- keep these two ideas apart, comments here say the queues are /dropped/ by a
--- reset and an unknown-key event is /ignored/.) This is what lets the generator
--- share a chain with unrelated traffic without recycling, or resetting on,
--- other people's events.
+-- INVARIANT: a payload's 'hold' must be enqueued before any of its releases,
+-- which the callers guarantee ('baAddPayload' holds before the payload becomes
+-- dequeuable, and an observer can only see a submitted payload). The worker
+-- therefore IGNORES a release for an unknown key: it is foreign (the observer
+-- broadcast is unfiltered), a duplicate (a second subscription), or already
+-- released. A keyed reset ('reset' with 'Just') obeys the same rule: for an
+-- unknown key NO reset happens, the event is ignored. (To keep these two ideas
+-- apart, comments here say the queues are /dropped/ by a reset and an
+-- unknown-key event is /ignored/.) This is what lets the generator share a
+-- chain with unrelated traffic without recycling, or resetting on, other
+-- people's events.
 module PullFiction.Internal.Recycler
   ( -- * Recycler.
     Recycler, mkRecycler
   , runRecycler
     -- * Event handlers.
-  , OnAddToBacklogEvent
-  , OnAddToPipeEvent
+  , OnHoldEvent
+  , OnReleaseEvent
   , OnResetEvent
     -- * Actions (fire-and-forget).
-  , addToBacklog
+  , hold
   , releaseOutputs
   , releaseConsumed
   , reset
@@ -102,7 +102,7 @@ import PullFiction.Internal.Pipe qualified as Pipe
 data PayloadLifecycle key input
   = -- | Add a payload's consumed inputs and produced outputs to the backlog,
     -- keyed by @key@.
-    AddToBacklog !key ![input] ![input]
+    Hold !key ![input] ![input]
     -- | Release the held outputs of @key@ to the input queue.
   | ReleaseOutputs !key
     -- | Release the held consumed inputs of @key@ to the input queue.
@@ -114,25 +114,34 @@ data PayloadLifecycle key input
   | Reset !(Maybe key) ![input]
 
 -- | Handler fired by the recycle worker each time it adds a payload entry to
--- the backlog ('addToBacklog'), with the payload's key, its consumed inputs,
--- its produced outputs and the resulting backlog size (e.g. for tracing). The
--- whole entry is passed: what to render is the handler's decision, not the
+-- the backlog ('hold'), with the payload's key, its consumed inputs, its
+-- produced outputs and the resulting backlog size (e.g. for tracing). The whole
+-- entry is passed: what to render is the handler's decision, not the
 -- recycler's. The final 'Natural' is the backlog size after this add: the
 -- number of payloads the recycler is holding, awaiting their release. It is NOT
 -- a pipe queue depth.
 -- Created by the caller and passed to 'mkRecycler', mirrors 'Pipe' events.
-type OnAddToBacklogEvent key input =
+type OnHoldEvent key input =
   key -> [input] -> [input] -> Natural -> IO ()
 
 -- | Handler fired by the recycle worker each time it adds recycled inputs to
--- the pipe's input queue, with the key of the payload being released, those
--- inputs and the resulting backlog size (e.g. for tracing).
+-- the pipe's input queue, with the key of the payload being released, the set
+-- that went back and the resulting backlog size (e.g. for tracing).
 --
--- The key is the same one 'OnAddToBacklogEvent' carried when the payload was
+-- 'Right' = the produced outputs went back ('releaseOutputs').
+-- 'Left'  = the consumed inputs went back ('releaseConsumed').
+--
+-- The same convention, the same way round, as the observer subscription the
+-- releases are driven from ('Config.Runtime.ohSubscribe'). Which set it is
+-- says /what/ the recycler did and never /why/: the caller wired the releases
+-- and so knows what each one means in its domain.
+--
+-- The key is the same one 'OnHoldEvent' carried when the payload was
 -- held, so the two events pair up: how long a payload waited is the time
 -- between them.
 -- Created by the caller and passed to 'mkRecycler', mirrors 'Pipe' events.
-type OnAddToPipeEvent key input = key -> [input] -> Natural -> IO ()
+type OnReleaseEvent key input =
+  key -> Either [input] [input] -> Natural -> IO ()
 
 -- | Handler fired by the recycle worker each time a reset drops the queued
 -- inputs and payloads and reseeds the input queue, with the dropped inputs, the
@@ -150,24 +159,23 @@ type OnResetEvent key input payload =
 data Recycler key input payload = Recycler
   { -- | The pipe whose input queue receives recycled inputs (via
     -- 'Pipe.addInputs').
-    recyclerPipe           :: !(Pipe.Pipe key input payload)
+    recyclerPipe      :: !(Pipe.Pipe key input payload)
     -- | Fired by the worker when it adds a payload's entry to the backlog,
-    -- with the key, the consumed inputs, the produced outputs and the
-    -- resulting backlog size (e.g. for tracing).
-  , recyclerOnAddToBacklog :: !(OnAddToBacklogEvent key input)
-    -- | Fired by the worker with the released payload's key, the inputs it
-    -- adds to the pipe and the resulting backlog size, each time it recycles
-    -- (e.g. for tracing).
-  , recyclerOnAddToPipe    :: !(OnAddToPipeEvent key input)
+    -- with the key, the consumed inputs, the produced outputs and the resulting
+    -- backlog size (e.g. for tracing).
+  , recyclerOnHold    :: !(OnHoldEvent key input)
+    -- | Fired by the worker with the payload's key, the set it added to the
+    -- pipe and the resulting backlog size, each time it recycles (e.g. for
+    -- tracing).
+  , recyclerOnRelease :: !(OnReleaseEvent key input)
     -- | Fired by the worker with the dropped inputs, the dropped payloads, the
     -- fresh inputs and the resulting backlog size, each time a reset drops the
     -- queued inputs and payloads and reseeds the input queue (e.g. for
     -- tracing).
-  , recyclerOnReset        :: !(OnResetEvent key input payload)
+  , recyclerOnReset   :: !(OnResetEvent key input payload)
     -- | The fire-and-forget lifecycle-signal queue: the actions write, the
-    -- worker reads (FIFO, see the 'AddToBacklog' before release invariant
-    -- above).
-  , recyclerInbox          :: !(STM.TQueue (PayloadLifecycle key input))
+    -- worker reads (FIFO, see the 'Hold' before release invariant above).
+  , recyclerInbox     :: !(STM.TQueue (PayloadLifecycle key input))
   }
 
 --------------------------------------------------------------------------------
@@ -179,28 +187,28 @@ mkRecycler
   :: Pipe.Pipe key input payload
   -- | Fired with the added entry (key, consumed inputs, produced outputs) and
   -- the resulting backlog size each time a payload enters the backlog.
-  -> OnAddToBacklogEvent key input
-  -- | Fired with the released payload's key, the inputs and the backlog size
-  -- each time the worker adds recycled inputs to the pipe.
-  -> OnAddToPipeEvent key input
+  -> OnHoldEvent key input
+  -- | Fired with the payload's key, the set that went back and the backlog
+  -- size each time the worker adds recycled inputs to the pipe.
+  -> OnReleaseEvent key input
   -- | Fired with the dropped inputs, the dropped payloads, the fresh inputs and
   -- the resulting backlog size each time a reset drops the queued inputs and
   -- payloads and reseeds the input queue.
   -> OnResetEvent key input payload
   -> IO (Recycler key input payload)
-mkRecycler pipe onAddToBacklog onAddToPipe onReset = do
+mkRecycler pipe onHold onRelease onReset = do
   inbox <- STM.newTQueueIO
   pure Recycler
-    { recyclerPipe           = pipe
-    , recyclerOnAddToBacklog = onAddToBacklog
-    , recyclerOnAddToPipe    = onAddToPipe
-    , recyclerOnReset        = onReset
-    , recyclerInbox          = inbox
+    { recyclerPipe      = pipe
+    , recyclerOnHold    = onHold
+    , recyclerOnRelease = onRelease
+    , recyclerOnReset   = onReset
+    , recyclerInbox     = inbox
     }
 
 -- | The worker's local record of one held payload: its consumed inputs and its
--- produced outputs, in that order, remembered at 'AddToBacklog' until a release
--- picks one set.
+-- produced outputs, in that order, remembered at 'Hold' until a release picks
+-- one set.
 data Held input = Held ![input] ![input]
 
 -- | Spawn the recycle worker and return it (unlinked, so the caller links it,
@@ -208,14 +216,14 @@ data Held input = Held ![input] ![input]
 --
 -- The worker drains the lifecycle-signal queue and acts on every event, keeping
 -- the held input sets in a worker-local map (only it touches it):
--- 'AddToBacklog' holds, 'ReleaseOutputs' \/ 'ReleaseConsumed' recycle the
+-- 'Hold' takes the entry, 'ReleaseOutputs' \/ 'ReleaseConsumed' recycle the
 -- picked set and forget the key, 'Reset' drops the queued inputs and payloads
 -- and reseeds the input queue with the fresh inputs it carries (gated on its
 -- key being held, when keyed). A release, or a keyed reset, for an unknown key
 -- is ignored (see the invariants in the module header).
 --
--- It fires 'recyclerOnAddToBacklog' when it adds a payload to the backlog,
--- 'recyclerOnAddToPipe' when a release adds inputs to the pipe (both with the
+-- It fires 'recyclerOnHold' when it adds a payload to the backlog,
+-- 'recyclerOnRelease' when a release adds inputs to the pipe (both with the
 -- resulting backlog size) and 'recyclerOnReset' when a reset drops the queued
 -- inputs and payloads and reseeds the input queue. It needs no observer or
 -- fetcher: the events arrive through the actions. When 'Config.Runtime' wires
@@ -235,13 +243,16 @@ runRecycler recycler name = Async.async $ do
       -- Recycle one set of a held payload and forget the key: add the set to
       -- the pipe ('Pipe.addInputs' is a no-op on an empty one), then fire the
       -- add-to-pipe handler.
-      recycle key inputs backlog = do
+      recycle key released backlog = do
+        -- Which side it is is for the handler below; the queue takes the
+        -- inputs either way, so the tag is dropped for this call alone.
         let backlog' = Map.delete key backlog
+            inputs   = either id id released
         Pipe.addInputs (recyclerPipe recycler) inputs
-        -- Caller event: AddToPipe. Fired after the fact with the key, the
-        -- inputs and the resulting backlog size, either way (an empty recycle
-        -- is traced too).
-        (recyclerOnAddToPipe recycler) key inputs (depthOf backlog')
+        -- Caller event: Release. Fired after the fact with the key, the set
+        -- that went back and the resulting backlog size, either way (an empty
+        -- recycle is traced too).
+        (recyclerOnRelease recycler) key released (depthOf backlog')
         pure backlog'
       go backlog = do
         event <- STM.atomically $ do
@@ -249,12 +260,12 @@ runRecycler recycler name = Async.async $ do
           STM.readTQueue (recyclerInbox recycler)
           ---------- STM ENDED ----------
         backlog' <- case event of
-          AddToBacklog key consumed outputs -> do
+          Hold key consumed outputs -> do
             let backlog' = Map.insert key (Held consumed outputs) backlog
-            -- Caller event: AddToBacklog. The payload's entry just entered
+            -- Caller event: Hold. The payload's entry just entered
             -- the backlog, fired after the fact with the key, both input
             -- sets and the resulting backlog size.
-            (recyclerOnAddToBacklog recycler) key consumed outputs
+            (recyclerOnHold recycler) key consumed outputs
               (depthOf backlog')
             pure backlog'
           -- The releases pick which held set returns to the input queue:
@@ -262,12 +273,14 @@ runRecycler recycler name = Async.async $ do
           -- key is ignored (see the module header).
           ReleaseOutputs key ->
             case Map.lookup key backlog of
-              Just (Held _consumed outputs) -> recycle key outputs backlog
-              Nothing                       -> pure backlog
+              Just (Held _consumed outputs) ->
+                recycle key (Right outputs) backlog
+              Nothing -> pure backlog
           ReleaseConsumed key ->
             case Map.lookup key backlog of
-              Just (Held consumed _outputs) -> recycle key consumed backlog
-              Nothing                       -> pure backlog
+              Just (Held consumed _outputs) ->
+                recycle key (Left consumed) backlog
+              Nothing -> pure backlog
           -- A keyed reset applies only while its key is held: like a release,
           -- an unknown key is foreign, a duplicate, or already superseded by an
           -- earlier reset that cleared the backlog. An unkeyed reset always
@@ -314,7 +327,7 @@ runRecycler recycler name = Async.async $ do
 -- the consumed inputs and the produced outputs, in that order. Exactly one
 -- later release ('releaseOutputs' or 'releaseConsumed') picks the set to
 -- recycle.
-addToBacklog
+hold
   :: Recycler key input payload
   -- | Key identifying the payload (e.g. its txId).
   -> key
@@ -323,8 +336,8 @@ addToBacklog
   -- | New inputs (outputs) produced by this payload.
   -> [input]
   -> IO ()
-addToBacklog recycler key consumedInputs outputInputs = do
-  send recycler (AddToBacklog key consumedInputs outputInputs)
+hold recycler key consumedInputs outputInputs = do
+  send recycler (Hold key consumedInputs outputInputs)
 
 -- | Release the held outputs of a payload to the input queue (fire-and-forget).
 -- Reason-free: 'Config.Runtime' decides when a payload counts as confirmed (at

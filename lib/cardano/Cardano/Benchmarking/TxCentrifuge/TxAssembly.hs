@@ -67,7 +67,7 @@ data BuildError
 -- @numOutputs@ outputs, distributed round-robin over the destinations: output
 -- @i@ pays to destination @i \`mod\` n@, where @n@ is the number of
 -- destinations given, and its recycled fund is keyed with that destination's
--- signing key. Returns the signed transaction, its 'Chain.TxKey' and the
+-- signing key. Returns the signed transaction, its 'Chain.TxRef' and the
 -- recycled funds (one per output).
 --
 -- The key carries both of a transaction's identifiers, the 'Chain.TxId' that
@@ -101,7 +101,7 @@ buildTx
   -> Natural
   -- | Fee.
   -> L.Coin
-  -> Either BuildError (Api.Tx era, Chain.TxKey, [Fund])
+  -> Either BuildError (Api.Tx era, Chain.TxRef, [Fund])
 buildTx sbe destinations inFunds numOutputs fee
   | null destinations = Left (InvalidInput "no destinations")
   | null inFunds      = Left (InvalidInput "no input funds")
@@ -132,16 +132,18 @@ buildTx sbe destinations inFunds numOutputs fee
                            txBody
                            (map Api.WitnessPaymentKey uniqueKeys)
               txId = Api.getTxId txBody
-              txKey = Chain.TxKey
+              -- 'Chain.Built': both identifiers and no block, nothing having
+              -- seen this transaction yet.
+              txRef = Chain.Built
                         (Chain.hashTxBytes (Api.serialiseToCBOR signedTx))
-                        (Just txId)
+                        txId
               outFunds = [ Fund { fundTxIn     = Api.TxIn txId (Api.TxIx ix)
                                 , fundLovelace = amt
                                 , fundSignKey  = fst (destinationFor ix)
                                 }
                          | (ix, amt) <- zip [0..] outAmounts
                          ]
-          in Right (signedTx, txKey, outFunds)
+          in Right (signedTx, txRef, outFunds)
   where
 
     totalIn :: Integer

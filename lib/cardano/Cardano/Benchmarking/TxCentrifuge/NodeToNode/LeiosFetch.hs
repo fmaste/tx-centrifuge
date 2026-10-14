@@ -122,7 +122,7 @@ leiosFetchClient
   -- | The observer's confirmation channel, the same one its ranking blocks are
   -- published on. An EB's transactions go on it as confirmed, at the block
   -- that certified the EB.
-  -> STM.TChan (Either Chain.BlockTx Chain.BlockTx)
+  -> STM.TChan (Either Chain.TxRef Chain.TxRef)
   -> LeiosFetchClient
 leiosFetchClient observerName queue broadcast =
   LF.leiosFetchClientPeer nextJob
@@ -147,26 +147,22 @@ leiosFetchClient observerName queue broadcast =
       (pure $ \case LF.MsgLeiosBlock eb -> received request eb)
 
   received :: Request -> Leios.LeiosEb -> IO ()
-  received request eb = case Chain.leiosEbTxHashes eb of
+  received request eb = case Chain.leiosEbTxRefs eb blockNo slotNo of
     -- See the module header: an empty EB here means the peer never acquired it.
     [] -> fatal $ "peer has no endorser block " ++ ebDescription
-    -- The transactions this EB puts on the chain, published as confirmed at
-    -- the block that certified it, which is where they enter it (see
-    -- 'Request'). One transaction, so an EB confirms all of its own or none.
-    txHashes -> STM.atomically $ mapM_ publish txHashes
+    -- Published as confirmed, one at a time, so an EB confirms all of its own
+    -- transactions or none.
+    txRefs -> STM.atomically $ mapM_ publish txRefs
    where
-    -- No id: an endorser block lists hashes only.
-    publish txHash =
-      STM.writeTChan broadcast $ Right Chain.BlockTx
-        { Chain.blockTxKey     = Chain.TxKey txHash Nothing
-        , Chain.blockTxBlockNo = requestBlockNo request
-        , Chain.blockTxSlotNo  = requestSlotNo  request
-        }
+    -- The block that certified this EB, which is where its transactions enter
+    -- the chain (see 'Request').
+    blockNo = requestBlockNo request
+    slotNo  = requestSlotNo  request
+    publish txRef = STM.writeTChan broadcast (Right txRef)
     ebDescription =
          Leios.prettyLeiosPoint (requestPoint request)
-      ++ " certified by confirmed block "
-      ++ show (requestBlockNo request)
-      ++ " (slot " ++ show (requestSlotNo request) ++ ")"
+      ++ " certified by confirmed block " ++ show blockNo
+      ++ " (slot " ++ show slotNo ++ ")"
     fatal reason =
       throwIO $ userError $ "observer " ++ observerName ++ ": " ++ reason
 

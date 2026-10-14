@@ -40,6 +40,7 @@ module Cardano.Benchmarking.TxCentrifuge.Tracing.Dispatcher
 -- base --
 ----------
 import Control.Exception (SomeException, try)
+import Numeric.Natural (Natural)
 -----------
 -- aeson --
 -----------
@@ -234,78 +235,87 @@ defaultTraceConfig = Logging.emptyTraceConfig
 -- [addr] an array of bech32 addresses. A fund array is [ref] at DDetailed and
 -- [obj] at DMaximum, which is 'renderFund' following the level it is given.
 --
---   Builder.NewTx (Info)                  Min    Nor    Det    Max
---     builder                             str    str    str    str
---     txHash, txId                        -      hex    hex    hex
---     inputs, outputs                     -      -      [ref]  [obj]
---     destinations                        -      -      -      [addr]
+--   Builder.NewTx (Info)                         Min    Nor    Det    Max
+--     builder                                    str    str    str    str
+--     txHash, txId                               -      hex    hex    hex
+--     inputs, outputs                            -      -      [ref]  [obj]
+--     destinations                               -      -      -      [addr]
 --
---   Builder.InputsDropped (Warning)       Min    Nor    Det    Max
---     builder                             str    str    str    str
---     reason                              -      str    str    str
---     inputs                              -      -      [ref]  [obj]
+--   Builder.InputsDropped (Warning)              Min    Nor    Det    Max
+--     builder                                    str    str    str    str
+--     reason                                     -      str    str    str
+--     inputs                                     -      -      [ref]  [obj]
 --
---   Pipe.Inputs.Enqueued (Info)           Min    Nor    Det    Max
+--   Pipe.Inputs.Enqueued (Info)                  Min    Nor    Det    Max
 --   Pipe.Inputs.Dequeued (Info)
---     pipe                                str    str    str    str
---     depth                               -      int    int    int
---     count                               -      int    int    int
---     inputs                              -      -      [ref]  [obj]
+--     pipe                                       str    str    str    str
+--     depth                                      -      int    int    int
+--     count                                      -      int    int    int
+--     inputs                                     -      -      [ref]  [obj]
 --
---   Pipe.Payload.Enqueued (Info)          Min    Nor    Det    Max
+--   Pipe.Payload.Enqueued (Info)                 Min    Nor    Det    Max
 --   Pipe.Payload.Dequeued (Info)
---     pipe                                str    str    str    str
---     depth                               -      int    int    int
---     txHash, txId                        -      -      hex    hex
+--     pipe                                       str    str    str    str
+--     depth                                      -      int    int    int
+--     txHash, txId                               -      -      hex    hex
 --
---   Recycler.AddToBacklog (Info)          Min    Nor    Det    Max
---     recycler                            str    str    str    str
---     backlog                             -      int    int    int
---     consumed_count, outputs_count       -      int    int    int
---     txHash, txId                        -      -      hex    hex
---     consumed, outputs                   -      -      [ref]  [obj]
+--   Recycler.Backlog.Held (Info)                 Min    Nor    Det    Max
+--     recycler                                   str    str    str    str
+--     backlog                                    -      int    int    int
+--     consumed_count, outputs_count              -      int    int    int
+--     txHash, txId                               -      -      hex    hex
+--     consumed, outputs                          -      -      [ref]  [obj]
 --
---   Recycler.AddToPipe (Info)             Min    Nor    Det    Max
---     recycler, pipe                      str    str    str    str
---     backlog                             -      int    int    int
---     count                               -      int    int    int
---     txHash, txId                        -      -      hex    hex
---     inputs                              -      -      [ref]  [obj]
+--   Recycler.Backlog.Released.Confirmed (Info)   Min    Nor    Det    Max
+--   Recycler.Backlog.Released.Orphaned (Warning)
+--     recycler, pipe                             str    str    str    str
+--     backlog                                    -      int    int    int
+--     count                                      -      int    int    int
+--     txHash, txId                               -      -      hex    hex
+--     blockNo, slotNo                            -      -      int    int
+--     inputs                                     -      -      [ref]  [obj]
 --
---   Recycler.Reset (Warning)              Min    Nor    Det    Max
---     recycler, pipe                      str    str    str    str
---     backlog (always 0)                  -      int    int    int
---     fresh_count                         -      int    int    int
---     dropped_inputs_count                -      int    int    int
---     dropped_payloads_count              -      int    int    int
---     fresh, dropped_inputs               -      -      [ref]  [obj]
---     dropped_payloads                    -      -      [hex]  [hex]
+--   Recycler.Backlog.Released.Optimistic (Info)  Min    Nor    Det    Max
+--     recycler, pipe                             str    str    str    str
+--     backlog                                    -      int    int    int
+--     count                                      -      int    int    int
+--     txHash, txId                               -      -      hex    hex
+--     inputs                                     -      -      [ref]  [obj]
 --
---   Observer.Announce.Confirmed (Info)    Min    Nor    Det    Max
+--   Recycler.Reset (Warning)                     Min    Nor    Det    Max
+--     recycler, pipe                             str    str    str    str
+--     backlog (always 0)                         -      int    int    int
+--     fresh_count                                -      int    int    int
+--     dropped_inputs_count                       -      int    int    int
+--     dropped_payloads_count                     -      int    int    int
+--     fresh, dropped_inputs                      -      -      [ref]  [obj]
+--     dropped_payloads                           -      -      [hex]  [hex]
+--
+--   Observer.Announce.Confirmed (Info)           Min    Nor    Det    Max
 --   Observer.Announce.Orphaned (Warning)
---     observer                            str    str    str    str
---     txHash, txId                        -      hex    hex    hex
---     blockNo, slotNo                     -      -      int    int
+--     observer                                   str    str    str    str
+--     txHash, txId                               -      hex    hex    hex
+--     blockNo, slotNo                            -      -      int    int
 --
---   TxSubmission.RequestTxIds (Info)      Min    Nor    Det    Max
---     target                              str    str    str    str
---     ack, req                            -      int    int    int
---     unacked                             -      -      -      [hex]
+--   TxSubmission.RequestTxIds (Info)             Min    Nor    Det    Max
+--     target                                     str    str    str    str
+--     ack, req                                   -      int    int    int
+--     unacked                                    -      -      -      [hex]
 --
---   TxSubmission.ReplyTxIds (Info)        Min    Nor    Det    Max
---     target                              str    str    str    str
---     ack, req (the request's)            -      int    int    int
---     txs                                 -      -      [idsz] [idsz]
---     unacked                             -      -      -      [hex]
+--   TxSubmission.ReplyTxIds (Info)               Min    Nor    Det    Max
+--     target                                     str    str    str    str
+--     ack, req (the request's)                   -      int    int    int
+--     txs                                        -      -      [idsz] [idsz]
+--     unacked                                    -      -      -      [hex]
 --
---   TxSubmission.RequestTxs (Info)        Min    Nor    Det    Max
---     target                              str    str    str    str
---     txIds                               -      -      -      [hex]
+--   TxSubmission.RequestTxs (Info)               Min    Nor    Det    Max
+--     target                                     str    str    str    str
+--     txIds                                      -      -      -      [hex]
 --
---   TxSubmission.ReplyTxs (Info)          Min    Nor    Det    Max
---     target                              str    str    str    str
---     txs                                 -      -      [idsz] [idsz]
---     requested                           -      -      -      [hex]
+--   TxSubmission.ReplyTxs (Info)                 Min    Nor    Det    Max
+--     target                                     str    str    str    str
+--     txs                                        -      -      [idsz] [idsz]
+--     requested                                  -      -      -      [hex]
 --
 -- The two protocol traces copied from cardano-node do not gate on the level:
 -- TxSubmission2.{MsgInit, RequestTxIds, ReplyTxIds, RequestTxs, ReplyTxs,
@@ -314,22 +324,77 @@ defaultTraceConfig = Logging.emptyTraceConfig
 -- MsgRequestTxs and a str "txs" on MsgReplyTxs, both Haskell 'show' output
 -- rather than JSON arrays.
 --
--- A txId is absent at every level when the key has none, which is a key read
--- from an endorser block (see 'Chain.TxKey').
+-- A txId is absent at every level for a ref read from an endorser block,
+-- which lists hashes and no bodies. A blockNo and slotNo are absent for a ref
+-- nothing has read off the chain, which is every ref a builder makes.
 
 --------------------------------------------------------------------------------
 -- Shared rendering
 --------------------------------------------------------------------------------
 
 -- | Render a payload key as machine-format fields: @txHash@ always, @txId@
--- when the key has one (see 'Chain.TxKey'). Both are 32 bytes of hex, so the
+-- when the key has one (see 'Chain.TxRef'). Both are 32 bytes of hex, so the
 -- field is the only thing that says which is which.
-renderTxKey :: Chain.TxKey -> Object
-renderTxKey txKey = mconcat $
-     [ "txHash" .= String (Hash.hashToTextAsHex (Chain.txKeyHash txKey)) ]
+renderTxRef :: Chain.TxRef -> Object
+renderTxRef txRef = mconcat $
+     [ "txHash" .= String (Hash.hashToTextAsHex (Chain.txRefHash txRef)) ]
   ++ [ "txId"   .= String (Api.serialiseToRawBytesHexText txId)
-     | Just txId <- [Chain.txKeyId txKey]
+     | Just txId <- [Chain.txRefId txRef]
      ]
+
+-- | Render a key's chain position as machine-format fields, when it has one
+-- (see 'Chain.txRefBlock'): the ranking block it was read in, by height and
+-- slot. A key nothing has seen on the chain renders no fields.
+renderTxRefBlock :: Chain.TxRef -> Object
+renderTxRefBlock txRef = mconcat
+  [ mconcat [ "blockNo" .= blockNo, "slotNo" .= slotNo ]
+  | Just (blockNo, slotNo) <- [Chain.txRefBlock txRef]
+  ]
+
+-- | A key's chain position for 'forHuman', empty when it has none.
+renderTxRefBlockHuman :: Chain.TxRef -> Text.Text
+renderTxRefBlockHuman txRef = mconcat
+  [    " blockNo=" <> Text.pack (show blockNo)
+    <> " slotNo="  <> Text.pack (show slotNo)
+  | Just (blockNo, slotNo) <- [Chain.txRefBlock txRef]
+  ]
+
+-- | The machine fields every @Recycler.Backlog.Released.*@ event carries: they
+-- differ only in the namespace that says why the payload was released, and in
+-- whether its key has a block (see 'renderTxRefBlock').
+renderRelease
+  :: Logging.DetailLevel
+  -> String
+  -> String
+  -> Natural
+  -> Chain.TxRef
+  -> [Fund.Fund]
+  -> Object
+renderRelease dtal name pipe backlog txRef inputs = mconcat $
+     [ "recycler" .= name
+     , "pipe"     .= pipe
+     ]
+  ++ [ "backlog"  .= backlog
+     | dtal >= Logging.DNormal
+     ]
+  ++ [ "count"    .= length inputs
+     | dtal >= Logging.DNormal
+     ]
+  ++ [ renderTxRef txRef <> renderTxRefBlock txRef
+     | dtal >= Logging.DDetailed
+     ]
+  ++ [ "inputs"   .= map (renderFund dtal) inputs
+     | dtal >= Logging.DDetailed
+     ]
+
+-- | The human line every release shares, labelled by why it happened.
+renderReleaseHuman
+  :: Text.Text -> String -> String -> Natural -> [Fund.Fund] -> Text.Text
+renderReleaseHuman label name pipe backlog inputs =
+     label <> " [" <> Text.pack name <> "]"
+  <> " pipe=" <> Text.pack pipe
+  <> " backlog=" <> Text.pack (show backlog)
+  <> " count=" <> Text.pack (show (length inputs))
 
 -- | Render a single fund for 'forMachine' output.
 --
@@ -423,9 +488,9 @@ instance Logging.MetaTrace BuilderTrace where
 -- NewTx [workload-name] \<txid\> inputs=[...] outputs=[...]
 -- @
 instance Logging.LogFormatting BuilderTrace where
-  forMachine dtal (BuilderNewTx name txKey dests inputs outputs) = mconcat $
+  forMachine dtal (BuilderNewTx name txRef dests inputs outputs) = mconcat $
        [ "builder" .= name ]
-    ++ [ renderTxKey txKey
+    ++ [ renderTxRef txRef
        | dtal >= Logging.DNormal
        ]
     ++ [ "destinations" .= map Api.serialiseAddress dests
@@ -445,9 +510,9 @@ instance Logging.LogFormatting BuilderTrace where
     ++ [ "inputs" .= map (renderFund dtal) inputs
        | dtal >= Logging.DDetailed
        ]
-  forHuman (BuilderNewTx name txKey _dest inputs outputs) =
+  forHuman (BuilderNewTx name txRef _dest inputs outputs) =
        "NewTx [" <> Text.pack name <> "] "
-    <> Hash.hashToTextAsHex (Chain.txKeyHash txKey)
+    <> Hash.hashToTextAsHex (Chain.txRefHash txRef)
     <> " inputs=["  <> renderFundTxIns inputs  <> "]"
     <> " outputs=[" <> renderFundTxIns outputs <> "]"
   forHuman (BuilderInputsDropped name inputs reason) =
@@ -496,7 +561,7 @@ instance Logging.MetaTrace PipeTrace where
 -- from 'Logging.DDetailed', its funds
 -- as references there and as objects at 'Logging.DMaximum' (see 'renderFund').
 -- Payload events add the payload's key from 'Logging.DDetailed', the level at
--- which the input events name their funds (see 'renderTxKey' for the fields it
+-- which the input events name their funds (see 'renderTxRef' for the fields it
 -- lands in). Human format shows just the depth (and, for inputs, the count).
 instance Logging.LogFormatting PipeTrace where
   forMachine dtal (PipeInputsEnqueued name depth inputs) = mconcat $
@@ -521,20 +586,20 @@ instance Logging.LogFormatting PipeTrace where
     ++ [ "inputs" .= map (renderFund dtal) inputs
        | dtal >= Logging.DDetailed
        ]
-  forMachine dtal (PipePayloadEnqueued name depth txKey) = mconcat $
+  forMachine dtal (PipePayloadEnqueued name depth txRef) = mconcat $
        [ "pipe"  .= name ]
     ++ [ "depth" .= depth
        | dtal >= Logging.DNormal
        ]
-    ++ [ renderTxKey txKey
+    ++ [ renderTxRef txRef
        | dtal >= Logging.DDetailed
        ]
-  forMachine dtal (PipePayloadDequeued name depth txKey) = mconcat $
+  forMachine dtal (PipePayloadDequeued name depth txRef) = mconcat $
        [ "pipe"  .= name ]
     ++ [ "depth" .= depth
        | dtal >= Logging.DNormal
        ]
-    ++ [ renderTxKey txKey
+    ++ [ renderTxRef txRef
        | dtal >= Logging.DDetailed
        ]
   forHuman (PipeInputsEnqueued name depth inputs) =
@@ -545,10 +610,10 @@ instance Logging.LogFormatting PipeTrace where
        "InputsDequeued [" <> Text.pack name <> "]"
     <> " depth=" <> Text.pack (show depth)
     <> " count=" <> Text.pack (show (length inputs))
-  forHuman (PipePayloadEnqueued name depth _txKey) =
+  forHuman (PipePayloadEnqueued name depth _txRef) =
        "PayloadEnqueued [" <> Text.pack name <> "]"
     <> " depth=" <> Text.pack (show depth)
-  forHuman (PipePayloadDequeued name depth _txKey) =
+  forHuman (PipePayloadDequeued name depth _txRef) =
        "PayloadDequeued [" <> Text.pack name <> "]"
     <> " depth=" <> Text.pack (show depth)
 
@@ -556,52 +621,85 @@ instance Logging.LogFormatting PipeTrace where
 -- Recycler trace rendering
 --------------------------------------------------------------------------------
 
--- | Namespaces: @TxCentrifuge.Recycler.{AddToBacklog, AddToPipe, Reset}@.
--- Outer prefix @[\"TxCentrifuge\", \"Recycler\"]@ is set in 'setupTracers'.
+-- | Namespaces: @TxCentrifuge.Recycler.Backlog.Held@,
+-- @TxCentrifuge.Recycler.Backlog.Released.{Confirmed, Orphaned, Optimistic}@
+-- and @TxCentrifuge.Recycler.Reset@. Outer prefix
+-- @[\"TxCentrifuge\", \"Recycler\"]@ is set in 'setupTracers'.
+--
+-- An entry enters the backlog under @Held@ and leaves under one of the
+-- releases, which name why, so @Recycler.Backlog.Released@ is one prefix for
+-- all three. Every release is for a key the backlog held, which makes these
+-- this generator's own transactions, where @Observer.Announce@ is the whole
+-- chain. 'RecyclerReset' stays outside the group: it drops the pipe's queued
+-- inputs and payloads too, and clears the backlog wholesale rather than
+-- releasing one entry.
 instance Logging.MetaTrace RecyclerTrace where
-  namespaceFor RecyclerAddToBacklog{} = Logging.Namespace [] ["AddToBacklog"]
-  namespaceFor RecyclerAddToPipe{}    = Logging.Namespace [] ["AddToPipe"]
-  namespaceFor RecyclerReset{}        = Logging.Namespace [] ["Reset"]
-  severityFor (Logging.Namespace _ ["AddToBacklog"]) _ = Just Logging.Info
-  severityFor (Logging.Namespace _ ["AddToPipe"])    _ = Just Logging.Info
-  severityFor (Logging.Namespace _ ["Reset"])        _ = Just Logging.Warning
+  namespaceFor RecyclerHeld{} = Logging.Namespace [] ["Backlog","Held"]
+  namespaceFor RecyclerReleasedConfirmed{} =
+    Logging.Namespace [] ["Backlog","Released","Confirmed"]
+  namespaceFor RecyclerReleasedOrphaned{} =
+    Logging.Namespace [] ["Backlog","Released","Orphaned"]
+  namespaceFor RecyclerReleasedOptimistic{} =
+    Logging.Namespace [] ["Backlog","Released","Optimistic"]
+  namespaceFor RecyclerReset{} = Logging.Namespace [] ["Reset"]
+  severityFor (Logging.Namespace _ ["Backlog","Held"]) _ = Just Logging.Info
+  severityFor (Logging.Namespace _ ["Backlog","Released","Confirmed"]) _ =
+    Just Logging.Info
+  severityFor (Logging.Namespace _ ["Backlog","Released","Orphaned"]) _ =
+    Just Logging.Warning
+  severityFor (Logging.Namespace _ ["Backlog","Released","Optimistic"]) _ =
+    Just Logging.Info
+  severityFor (Logging.Namespace _ ["Reset"]) _ = Just Logging.Warning
   severityFor _ _ = Nothing
-  documentFor (Logging.Namespace _ ["AddToBacklog"]) = Just $
-    "The recycler added a payload's entry to its backlog: the key and both "
+  documentFor (Logging.Namespace _ ["Backlog","Held"]) = Just $
+    "A payload's entry entered the recycler's backlog: the key and both "
     <> "input sets, held until a release picks one. The backlog count is "
     <> "the number of held payloads, not a pipe queue depth."
-  documentFor (Logging.Namespace _ ["AddToPipe"]) = Just
-    "The recycler added a payload's recycled inputs back onto a pipe's input queue (count at DDetailed, full inputs at DMaximum)."
+  documentFor (Logging.Namespace _ ["Backlog","Released","Confirmed"]) = Just $
+    "The chain confirmed a held payload, so its outputs went back onto a "
+    <> "pipe's input queue. The key carries the block it was confirmed in "
+    <> "(from DDetailed). Own traffic: the backlog held this key."
+  documentFor (Logging.Namespace _ ["Backlog","Released","Orphaned"]) = Just $
+    "A held payload's block was rolled back, so its consumed inputs went "
+    <> "back instead of its outputs. The key carries the rolled-back block."
+  documentFor (Logging.Namespace _ ["Backlog","Released","Optimistic"]) = Just $
+    "A held payload was released with no chain verdict, which is on_build "
+    <> "and on_pull: its outputs went back straight away and its key has no "
+    <> "block."
   documentFor (Logging.Namespace _ ["Reset"]) = Just $
     "The recycler reset a pipe for a builder's recovery: the queued inputs "
     <> "and the queued payloads built from them were dropped, and the input "
-    <> "queue was reseeded with fresh inputs (counts at DDetailed, full "
-    <> "inputs at DMaximum)."
+    <> "queue was reseeded with fresh inputs (counts from DNormal, the "
+    <> "arrays from DDetailed)."
   documentFor _ = Nothing
   allNamespaces =
-    [ Logging.Namespace [] ["AddToBacklog"]
-    , Logging.Namespace [] ["AddToPipe"]
+    [ Logging.Namespace [] ["Backlog","Held"]
+    , Logging.Namespace [] ["Backlog","Released","Confirmed"]
+    , Logging.Namespace [] ["Backlog","Released","Orphaned"]
+    , Logging.Namespace [] ["Backlog","Released","Optimistic"]
     , Logging.Namespace [] ["Reset"]
     ]
 
 -- | Machine format: every event emits @recycler@ at every level and @backlog@
 -- (the resulting backlog size, not a queue depth) from 'Logging.DNormal', then
 -- the same ladder as everywhere else: counts from 'Logging.DNormal', arrays
--- from 'Logging.DDetailed' with their
--- funds as references there and as objects at 'Logging.DMaximum' (see
--- 'renderFund'), payload keys from 'Logging.DDetailed' (see 'renderTxKey').
+-- from 'Logging.DDetailed' with their funds as references there and as objects
+-- at 'Logging.DMaximum' (see 'renderFund'), payload keys from
+-- 'Logging.DDetailed' (see 'renderTxRef').
 --
--- * 'RecyclerAddToBacklog': @consumed_count@ and @outputs_count@, then the
---   @consumed@ and @outputs@ arrays, then the held payload's key.
--- * 'RecyclerAddToPipe' (also @pipe@): @count@, then the @inputs@ array, then
---   the released payload's key.
+-- * 'RecyclerHeld': @consumed_count@ and @outputs_count@, then the @consumed@
+--   and @outputs@ arrays, then the held payload's key.
+-- * The three releases (also @pipe@): @count@, then the released payload's key
+--   and, when it has one, the block it was read in (see 'renderTxRefBlock'),
+--   then the @inputs@ array. One renderer serves all three ('renderRelease'):
+--   they differ in their namespace, and in whether that block is there.
 -- * 'RecyclerReset' (also @pipe@): @fresh_count@, @dropped_inputs_count@ and
 --   @dropped_payloads_count@, then the @fresh@, @dropped_inputs@ and
 --   @dropped_payloads@ arrays, the last being payload keys as hex.
 --
 -- Human format shows the backlog size and the counts.
 instance Logging.LogFormatting RecyclerTrace where
-  forMachine dtal (RecyclerAddToBacklog recyclerName backlog txKey consumed outputs) =
+  forMachine dtal (RecyclerHeld recyclerName backlog txRef consumed outputs) =
     mconcat $
        [ "recycler" .= recyclerName ]
     ++ [ "backlog"  .= backlog
@@ -613,7 +711,7 @@ instance Logging.LogFormatting RecyclerTrace where
     ++ [ "outputs_count" .= length outputs
        | dtal >= Logging.DNormal
        ]
-    ++ [ renderTxKey txKey
+    ++ [ renderTxRef txRef
        | dtal >= Logging.DDetailed
        ]
     ++ [ "consumed" .= map (renderFund dtal) consumed
@@ -622,23 +720,12 @@ instance Logging.LogFormatting RecyclerTrace where
     ++ [ "outputs" .= map (renderFund dtal) outputs
        | dtal >= Logging.DDetailed
        ]
-  forMachine dtal (RecyclerAddToPipe recyclerName pipeName backlog txKey inputs) =
-    mconcat $
-       [ "recycler" .= recyclerName
-       , "pipe"     .= pipeName
-       ]
-    ++ [ "backlog"  .= backlog
-       | dtal >= Logging.DNormal
-       ]
-    ++ [ "count"  .= length inputs
-       | dtal >= Logging.DNormal
-       ]
-    ++ [ renderTxKey txKey
-       | dtal >= Logging.DDetailed
-       ]
-    ++ [ "inputs" .= map (renderFund dtal) inputs
-       | dtal >= Logging.DDetailed
-       ]
+  forMachine dtal (RecyclerReleasedConfirmed name pipe backlog txRef inputs) =
+    renderRelease dtal name pipe backlog txRef inputs
+  forMachine dtal (RecyclerReleasedOrphaned name pipe backlog txRef inputs) =
+    renderRelease dtal name pipe backlog txRef inputs
+  forMachine dtal (RecyclerReleasedOptimistic name pipe backlog txRef inputs) =
+    renderRelease dtal name pipe backlog txRef inputs
   forMachine dtal (RecyclerReset recyclerName pipeName backlog droppedPayloads droppedInputs fresh) =
     mconcat $
        [ "recycler" .= recyclerName
@@ -663,19 +750,20 @@ instance Logging.LogFormatting RecyclerTrace where
        | dtal >= Logging.DDetailed
        ]
     ++ [ "dropped_payloads" .=
-           map (String . Hash.hashToTextAsHex . Chain.txKeyHash) droppedPayloads
+           map (String . Hash.hashToTextAsHex . Chain.txRefHash) droppedPayloads
        | dtal >= Logging.DDetailed
        ]
-  forHuman (RecyclerAddToBacklog recyclerName backlog _txKey consumed outputs) =
-       "AddToBacklog [" <> Text.pack recyclerName <> "]"
+  forHuman (RecyclerHeld recyclerName backlog _txRef consumed outputs) =
+       "Held [" <> Text.pack recyclerName <> "]"
     <> " backlog=" <> Text.pack (show backlog)
     <> " consumed_count=" <> Text.pack (show (length consumed))
     <> " outputs_count=" <> Text.pack (show (length outputs))
-  forHuman (RecyclerAddToPipe recyclerName pipeName backlog _txKey inputs) =
-       "AddToPipe [" <> Text.pack recyclerName <> "]"
-    <> " pipe=" <> Text.pack pipeName
-    <> " backlog=" <> Text.pack (show backlog)
-    <> " count=" <> Text.pack (show (length inputs))
+  forHuman (RecyclerReleasedConfirmed name pipe backlog _txRef inputs) =
+    renderReleaseHuman "Confirmed" name pipe backlog inputs
+  forHuman (RecyclerReleasedOrphaned name pipe backlog _txRef inputs) =
+    renderReleaseHuman "Orphaned" name pipe backlog inputs
+  forHuman (RecyclerReleasedOptimistic name pipe backlog _txRef inputs) =
+    renderReleaseHuman "Optimistic" name pipe backlog inputs
   forHuman (RecyclerReset recyclerName pipeName backlog droppedPayloads droppedInputs fresh) =
        "Reset [" <> Text.pack recyclerName <> "]"
     <> " pipe=" <> Text.pack pipeName
@@ -709,38 +797,30 @@ instance Logging.MetaTrace ObserverTrace where
     ]
 
 instance Logging.LogFormatting ObserverTrace where
-  forMachine dtal (ObserverConfirmed observer txKey blockNo slotNo) = mconcat $
+  forMachine dtal (ObserverConfirmed observer txRef) = mconcat $
        [ "observer" .= observer ]
-    ++ [ renderTxKey txKey
+    ++ [ renderTxRef txRef
        | dtal >= Logging.DNormal
        ]
-    ++ [ "blockNo" .= blockNo
+    ++ [ renderTxRefBlock txRef
        | dtal >= Logging.DDetailed
        ]
-    ++ [ "slotNo"  .= slotNo
-       | dtal >= Logging.DDetailed
-       ]
-  forMachine dtal (ObserverOrphaned observer txKey blockNo slotNo) = mconcat $
+  forMachine dtal (ObserverOrphaned observer txRef) = mconcat $
        [ "observer" .= observer ]
-    ++ [ renderTxKey txKey
+    ++ [ renderTxRef txRef
        | dtal >= Logging.DNormal
        ]
-    ++ [ "blockNo" .= blockNo
+    ++ [ renderTxRefBlock txRef
        | dtal >= Logging.DDetailed
        ]
-    ++ [ "slotNo"  .= slotNo
-       | dtal >= Logging.DDetailed
-       ]
-  forHuman (ObserverConfirmed observer txKey blockNo slotNo) =
+  forHuman (ObserverConfirmed observer txRef) =
        "Confirmed [" <> Text.pack observer <> "]"
-    <> " txHash=" <> Hash.hashToTextAsHex (Chain.txKeyHash txKey)
-    <> " blockNo=" <> Text.pack (show blockNo)
-    <> " slotNo=" <> Text.pack (show slotNo)
-  forHuman (ObserverOrphaned observer txKey blockNo slotNo) =
+    <> " txHash=" <> Hash.hashToTextAsHex (Chain.txRefHash txRef)
+    <> renderTxRefBlockHuman txRef
+  forHuman (ObserverOrphaned observer txRef) =
        "Orphaned [" <> Text.pack observer <> "]"
-    <> " txHash=" <> Hash.hashToTextAsHex (Chain.txKeyHash txKey)
-    <> " blockNo=" <> Text.pack (show blockNo)
-    <> " slotNo=" <> Text.pack (show slotNo)
+    <> " txHash=" <> Hash.hashToTextAsHex (Chain.txRefHash txRef)
+    <> renderTxRefBlockHuman txRef
 
 --------------------------------------------------------------------------------
 -- TxSubmission trace rendering

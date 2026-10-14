@@ -20,8 +20,8 @@
 --
 -- * Outbound (submitting): @Api.Tx@ → @GenTx@ via 'toGenTx'.
 -- * Inbound (node replies): @GenTxId@ → 'TxId' via 'fromGenTxId'.
--- * Inbound (chain-following): @CardanoBlock@ → @['TxKey']@ via
---   'extractTxKeys', which also reaches into @cardano-ledger@ to unwrap raw
+-- * Inbound (chain-following): @CardanoBlock@ → @['TxRef']@ via
+--   'extractTxRefs', which also reaches into @cardano-ledger@ to unwrap raw
 --   block bodies (ideally @cardano-api@ would provide this, but it currently
 --   does not).
 --
@@ -62,21 +62,24 @@ module Cardano.Benchmarking.TxCentrifuge.Chain
     -- An endorser block is a list of @(TxHash, size)@ references and carries no
     -- bodies, so it commits to the bytes a peer will serve and there is no
     -- 'TxId' in it. Nor can one be derived: that needs the body, which is what
-    -- the EB deliberately leaves out. Hence 'TxKey' is the hash plus the id
-    -- when its source had one, and 'txKeyId' is 'Nothing' for a key read from
-    -- an endorser block.
+    -- the EB deliberately leaves out. Hence 'TxRef' is the hash plus the id
+    -- when its source had one, which is why a ref read from an endorser block
+    -- has no 'txRefId'.
     TxId, TxHash
-  , TxKey (..)
+    -- A transaction as the source that gave it to us knows it. Only 'Built' is
+    -- exported, the shape with no chain position, so anything may make one off
+    -- chain; the chain-read shapes are made in this module alone, which is
+    -- what makes a ref's block worth trusting.
+  , TxRef (Built)
+  , txRefHash, txRefId, txRefBlock
     -- * Block type.
   , CardanoBlock
   , BlockNo
   , SlotNo
-    -- * A block's transaction.
-  , BlockTx (..)
     -- * Era check.
   , eraMismatch
     -- * Transaction extraction.
-  , extractTxKeys
+  , extractTxRefs
   , hashTxBytes
     -- * Protocol boundary.
   , toGenTx
@@ -87,7 +90,7 @@ module Cardano.Benchmarking.TxCentrifuge.Chain
     -- import "LeiosDemoTypes" qualified, as this module does.
   , leiosAnnouncedPoint
   , leiosCarriesCert
-  , leiosEbTxHashes
+  , leiosEbTxRefs
 #endif
   ) where
 
@@ -152,35 +155,64 @@ type TxId = Api.TxId
 -- @TxHash@, see the section header for how it differs from 'TxId'.
 type TxHash = Hash.Hash Hash.Blake2b_256 BS.ByteString
 
--- | How a transaction is identified across the pipeline: by its 'TxHash', with
--- its 'TxId' alongside when whoever built the key had it.
+-- | A transaction as one source knows it: always its 'TxHash', and whatever
+-- else that source had.
 --
--- The hash and not the id, because it is the only identifier every source has.
--- A ranking block's body carries the transaction itself and yields both
--- ('extractTxKeys'); an endorser block yields the hash alone
--- ('leiosEbTxHashes'); a transaction that appears through either is the same
--- key.
-data TxKey = TxKey
-  { -- | Always known.
-    txKeyHash :: !TxHash
-    -- | 'Nothing' for a key read from an endorser (Leios) block.
-  , txKeyId   :: !(Maybe TxId)
-  }
+-- The hash and not the id, because it is the only identifier every source has:
+-- an endorser block lists hashes and carries no bodies, so there is no id in
+-- it and none can be derived, that needing the body the EB leaves out.
+--
+-- Three sources, so three shapes. Each names what it knows instead of leaving
+-- a reader to work out which combinations occur.
+data TxRef
+  = -- | Built here ('TxAssembly.buildTx'): both identifiers, and no block,
+    -- nothing having seen the transaction anywhere yet.
+    Built !TxHash !TxId
+    -- | Read from a ranking block's body ('extractTxRefs'): both identifiers
+    -- and the block it was read in.
+  | InBody !TxHash !TxId !BlockNo !SlotNo
+    -- | Read from an endorser (Leios) block ('leiosEbTxRefs'): the hash, and
+    -- the /certifying/ ranking block, which is where an EB's transactions
+    -- enter the chain.
+  | InEb !TxHash !BlockNo !SlotNo
   deriving Show
 
--- | By 'txKeyHash' alone, the only field always there. The hash is taken over
--- the serialised transaction, which contains the body, so equal hashes mean the
--- same transaction and the same 'txKeyId': a key read from an endorser block
--- and one read from a body are equal when they are that transaction, which is
--- what lets one backlog lookup serve both.
---
--- So '==' ignores 'txKeyId'. The recycler keys its backlog with the 'Ord'
--- below, which has to be a total order over what is always present.
-instance Eq TxKey where
-  a == b = txKeyHash a == txKeyHash b
+-- | The hash, which every shape has.
+txRefHash :: TxRef -> TxHash
+txRefHash = \case
+  Built  txHash _     -> txHash
+  InBody txHash _ _ _ -> txHash
+  InEb   txHash _ _   -> txHash
 
-instance Ord TxKey where
-  compare = comparing txKeyHash
+-- | The transaction id, when the source had the body it is derived from.
+txRefId :: TxRef -> Maybe TxId
+txRefId = \case
+  Built  _ txId     -> Just txId
+  InBody _ txId _ _ -> Just txId
+  InEb   _ _ _      -> Nothing
+
+-- | The ranking block this was read in, when it was read from the chain.
+txRefBlock :: TxRef -> Maybe (BlockNo, SlotNo)
+txRefBlock = \case
+  Built  _ _                -> Nothing
+  InBody _ _ blockNo slotNo -> Just (blockNo, slotNo)
+  InEb   _   blockNo slotNo -> Just (blockNo, slotNo)
+
+-- | By 'txRefHash' alone, the only field every shape has. The hash is taken
+-- over the serialised transaction, which contains the body, so equal hashes
+-- mean the same transaction: a ref read from an endorser block and one read
+-- from a body are equal when they are that transaction, which is what lets one
+-- backlog lookup serve both.
+--
+-- So '==' ignores everything the source happened to know beyond the hash. That
+-- is what makes a 'Built' ref equal to the 'InBody' or 'InEb' ref that settles
+-- it, which is the match the recycler's backlog is keyed on, and why 'Ord'
+-- below orders on what is always present.
+instance Eq TxRef where
+  a == b = txRefHash a == txRefHash b
+
+instance Ord TxRef where
+  compare = comparing txRefHash
 
 --------------------------------------------------------------------------------
 -- Block type.
@@ -192,31 +224,11 @@ type CardanoBlock = Cardano.CardanoBlock Eras.StandardCrypto
 
 -- | A block's height and slot, aliased from @ouroboros-consensus@ so that a
 -- caller naming a block's coordinates takes them from here along with
--- 'CardanoBlock' and 'BlockTx'.
+-- 'CardanoBlock' and 'TxRef'.
 type BlockNo = Block.BlockNo
 
 -- | See 'BlockNo'.
 type SlotNo = Block.SlotNo
-
---------------------------------------------------------------------------------
--- Block transactions.
---------------------------------------------------------------------------------
-
--- | A transaction observed on the chain, used for both confirmed and orphaned
--- (rolled-back) transactions.
---
--- The block number and slot are always a ranking block's. For a Leios
--- transaction, which is in no ranking block's body, they are the certifying
--- ranking block's: that is where it enters the chain.
-data BlockTx = BlockTx
-  { -- | The transaction, by the identifier this observer read (see 'TxKey').
-    blockTxKey     :: !TxKey
-    -- | Block number where this transaction was observed.
-  , blockTxBlockNo :: !BlockNo
-    -- | Slot number where this transaction was observed.
-  , blockTxSlotNo  :: !SlotNo
-  }
-  deriving (Show, Eq)
 
 --------------------------------------------------------------------------------
 -- Era check.
@@ -254,7 +266,7 @@ eraMismatch block
 -- Transaction extraction.
 --------------------------------------------------------------------------------
 
--- | The 'TxKey' of every transaction in a ranking block\'s body, in order.
+-- | The 'TxRef' of every transaction in a ranking block\'s body, in order.
 -- Both identifiers, the body carrying the transactions themselves. What a
 -- chain follower reports.
 --
@@ -266,20 +278,24 @@ eraMismatch block
 -- reproduces the submitted bytes for anything this generator built, as both
 -- sides serialise the same ledger value with the same encoder, which is also
 -- the encoder a forging node hashes an endorser block entry with.
-extractTxKeys :: CardanoBlock -> [TxKey]
-extractTxKeys = \case
-  -- Byron era: skip (different tx format and not relevant for benchmarking).
-  Cardano.BlockByron _ -> []
-  -- Shelley-based eras.
-  Cardano.BlockShelley  blk -> extractFromShelleyBlock blk
-  Cardano.BlockAllegra  blk -> extractFromShelleyBlock blk
-  Cardano.BlockMary     blk -> extractFromShelleyBlock blk
-  Cardano.BlockAlonzo   blk -> extractFromShelleyBlock blk
-  Cardano.BlockBabbage  blk -> extractFromShelleyBlock blk
-  Cardano.BlockConway   blk -> extractFromShelleyBlock blk
-  Cardano.BlockDijkstra blk -> extractFromShelleyBlock blk
+extractTxRefs :: CardanoBlock -> [TxRef]
+extractTxRefs block =
+  -- This block's coordinates, read once and given to every ref it yields.
+  let blockNo = Block.blockNo   block
+      slotNo  = Block.blockSlot block
+  in case block of
+       -- Byron era: skip (different tx format, not relevant for benchmarking).
+       Cardano.BlockByron _ -> []
+       -- Shelley-based eras.
+       Cardano.BlockShelley  blk -> extractFromShelleyBlock blockNo slotNo blk
+       Cardano.BlockAllegra  blk -> extractFromShelleyBlock blockNo slotNo blk
+       Cardano.BlockMary     blk -> extractFromShelleyBlock blockNo slotNo blk
+       Cardano.BlockAlonzo   blk -> extractFromShelleyBlock blockNo slotNo blk
+       Cardano.BlockBabbage  blk -> extractFromShelleyBlock blockNo slotNo blk
+       Cardano.BlockConway   blk -> extractFromShelleyBlock blockNo slotNo blk
+       Cardano.BlockDijkstra blk -> extractFromShelleyBlock blockNo slotNo blk
 
--- | 'extractTxKeys' for a Shelley-based ranking block.
+-- | 'extractTxRefs' for a Shelley-based ranking block.
 --
 -- "Shelley-based" is the block /shape/, not the era. @ShelleyBlock proto era@
 -- is the format introduced at Shelley and still used by every later era, so
@@ -294,24 +310,30 @@ extractTxKeys = \case
 -- included, and only Dijkstra ranking blocks can carry Leios fields.
 extractFromShelleyBlock
   :: Core.EraBlockBody ledgerEra
-  => Shelley.ShelleyBlock proto ledgerEra
-  -> [TxKey]
+  => BlockNo
+  -> SlotNo
+  -> Shelley.ShelleyBlock proto ledgerEra
+  -> [TxRef]
 -- The key is built inline rather than through a @where@ binding: as a binding
 -- it is generalised over the transaction's level, and its inferred context then
 -- carries a constraint on a type family application that Haskell2010 cannot
 -- write. Inline, the level is whatever 'Core.txSeqBlockBodyL' yields and
 -- nothing is generalised.
 --
--- The id is forced: a key can sit in an observer's limbo for twice the
--- confirmation depth, and unevaluated it would hold the decoded transaction it
--- is computed from alive for that long.
-extractFromShelleyBlock shelleyBlock =
+-- Every 'InBody' field is strict, which is what keeps a ref from retaining the
+-- transaction and the block it was read from: a ref can sit in an observer's
+-- limbo for twice the confirmation depth, and an unevaluated id or height
+-- would hold that whole decoded block alive for as long.
+extractFromShelleyBlock blockNo slotNo shelleyBlock =
   case Shelley.shelleyBlockRaw shelleyBlock of
     LedgerBlock.Block _ body ->
       let txSeq = getConst (Core.txSeqBlockBodyL Const body)
-      in [ txId `seq` TxKey (hashTxBytes (Plain.serialize' tx)) (Just txId)
+      in [ InBody
+             (hashTxBytes (Plain.serialize' tx))
+             (Api.fromShelleyTxId (Core.txIdTx tx))
+             blockNo
+             slotNo
          | tx <- toList txSeq
-         , let txId = Api.fromShelleyTxId (Core.txIdTx tx)
          ]
 
 -- | Hash a transaction\'s serialised bytes into a 'TxHash'.
@@ -370,7 +392,7 @@ fromGenTxId (Cardano.GenTxIdDijkstra (Mempool.ShelleyTxId i)) =
 -- An announced EB is not yet part of the chain. Only the /next/ ranking block
 -- can certify it, by carrying a Leios certificate ('leiosCarriesCert'), and
 -- only then do the EB's transactions count. Its transactions are in no ranking
--- block's body either way, so 'extractTxKeys' never finds them: they are fetched
+-- block's body either way, so 'extractTxRefs' never finds them: they are fetched
 -- over the LeiosFetch mini-protocol.
 --
 -- Only the Dijkstra era announces anything; every earlier era returns 'Nothing',
@@ -398,19 +420,22 @@ leiosAnnouncedPoint =
 leiosCarriesCert :: CardanoBlock -> Bool
 leiosCarriesCert = Forker.headerContainsLeiosCert . Block.getHeader
 
--- | The transactions an endorser block lists, in order, as 'TxHash'es.
+-- | The transactions an endorser block lists, in order, as 'InEb' refs read in
+-- the ranking block the caller passes: the one that certified this EB, which
+-- is where its transactions enter the chain.
 --
--- An EB carries hashes and sizes, never transaction bodies, so this is the
--- whole content of one. A 'TxKey' built from one of these has no 'txKeyId',
--- which is the difference from what 'extractTxKeys' returns for a body.
+-- An EB carries hashes and sizes, never transaction bodies, so those hashes
+-- are the whole content of one and the refs have no 'txRefId', which is the
+-- difference from what 'extractTxRefs' returns for a body.
 --
 -- Upstream holds an entry\'s hash as @PackedBytes 32@, which is the
 -- representation a 'TxHash' already is, so the conversion is total and carries
 -- no cost. This is the only place a Leios type becomes one of ours: nothing
--- outside this module names @Leios.TxHash@.
-leiosEbTxHashes :: Leios.LeiosEb -> [TxHash]
-leiosEbTxHashes eb =
-  [ Hash.hashFromPackedBytes bytes
+-- outside this module names @Leios.TxHash@, and 'InEb' is not exported, so
+-- this is also the only place a ref can claim to have come from an EB.
+leiosEbTxRefs :: Leios.LeiosEb -> BlockNo -> SlotNo -> [TxRef]
+leiosEbTxRefs eb blockNo slotNo =
+  [ InEb (Hash.hashFromPackedBytes bytes) blockNo slotNo
   | (Leios.MkTxHash bytes, _size) <- toList (Leios.leiosEbTxs eb)
   ]
 

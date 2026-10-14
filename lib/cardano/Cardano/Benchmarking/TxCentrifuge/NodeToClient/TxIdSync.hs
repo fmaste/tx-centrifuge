@@ -134,17 +134,20 @@ data State = State
     -- Uses @TVar (Seq …)@ instead of @TBQueue@ because rollbacks need to filter
     -- out blocks children of the rollback point.
   , statePendingBlocks :: !(STM.TVar (Seq Chain.CardanoBlock))
-    -- | Tx IDs from rolled-back blocks awaiting resolution.
-    -- Resolved when confirmed blocks catch up: entries whose tx ID appears in
-    -- a confirmed block are removed; entries whose height has been confirmed
+    -- | Transactions from rolled-back blocks awaiting resolution, each with
+    -- the height of the block it was rolled back from: that height is this
+    -- queue's own bookkeeping, so it is kept here rather than read back off
+    -- the ref, which would make the timeout below partial.
+    -- Resolved when confirmed blocks catch up: entries that appear in a
+    -- confirmed block are removed; entries whose height has been confirmed
     -- past are broadcast as orphans (Left).
-  , stateLimbo         :: !(STM.TVar (Seq Chain.BlockTx))
+  , stateLimbo         :: !(STM.TVar (Seq (Chain.BlockNo, Chain.TxRef)))
     -- | Broadcast channel for confirmed and orphaned transactions.
     -- 'Right' = confirmed (recycle output inputs).
     -- 'Left'  = orphaned  (recycle original inputs).
     -- Write-only end; subscribers obtain a read-end via
     -- @STM.dupTChan . stateBroadcast@.
-  , stateBroadcast     :: !(STM.TChan (Either Chain.BlockTx Chain.BlockTx))
+  , stateBroadcast     :: !(STM.TChan (Either Chain.TxRef Chain.TxRef))
   }
 
 -- | Create initial sync state.
@@ -204,13 +207,9 @@ chainSyncClient state = CS.ChainSyncClient $ pure clientStIdle
             STM.writeTVar (statePendingBlocks state) keep
             -- Discarded blocks: Append discarded txs IDs to `stateLimbo`.
             let newLimbo = Seq.fromList
-                  [ Chain.BlockTx
-                      { Chain.blockTxKey     = txKey
-                      , Chain.blockTxBlockNo = Block.blockNo   block
-                      , Chain.blockTxSlotNo  = Block.blockSlot block
-                      }
+                  [ (Block.blockNo block, txRef)
                   | block <- toList discard
-                  , txKey <- Chain.extractTxKeys block
+                  , txRef <- Chain.extractTxRefs block
                   ]
             STM.modifyTVar' (stateLimbo state) (\q -> q <> newLimbo)
             ---------- STM ENDED ----------
@@ -254,15 +253,8 @@ processNewBlock state newBlock = do
   STM.writeTVar (statePendingBlocks state) remainingBlocks
   -- Broadcast each confirmed transaction.
   forM_ confirmedBlocks $ \block -> do -- No `toList`, skips intermediate list.
-    forM_ (Chain.extractTxKeys block) $ \txKey -> do
-      STM.writeTChan
-        (stateBroadcast state)
-        (Right Chain.BlockTx
-          { Chain.blockTxKey     = txKey
-          , Chain.blockTxBlockNo = Block.blockNo   block
-          , Chain.blockTxSlotNo  = Block.blockSlot block
-          }
-        )
+    forM_ (Chain.extractTxRefs block) $ \txRef -> do
+      STM.writeTChan (stateBroadcast state) (Right txRef)
   -- Resolve limbo against confirmed blocks.
   -- Tx IDs that reappear in a confirmed block are removed (the `Right`
   -- broadcast above already recycles their outputs).
@@ -277,28 +269,32 @@ processNewBlock state newBlock = do
               _                            -> 0
             -- Extract the confirmed transactions' keys to a set, more
             -- efficient queries.
-            confirmedTxKeys =
+            confirmedTxRefs =
               Set.fromList
-                [ txKey
+                [ txRef
                 | block <- toList confirmedBlocks
-                , txKey <- Chain.extractTxKeys block
+                , txRef <- Chain.extractTxRefs block
                 ]
-            blockTxConfirmed e = Chain.blockTxKey e `Set.member` confirmedTxKeys
+            -- Two predicates over one limbo entry, which is the height it
+            -- was rolled back from paired with the ref itself.
+            txRefConfirmed (_blockNo, txRef) =
+              txRef `Set.member` confirmedTxRefs
             -- Allow confirmationDepth extra blocks for the tx to reappear at a
             -- different height on the winning fork. Forks deeper than
             -- confirmationDepth already cause permanent fund loss by design.
-            pastConfirmed    e =
-              lastConfirmedBlockNo >= Chain.blockTxBlockNo e + depth
+            pastConfirmed (blockNo, _txRef) =
+              lastConfirmedBlockNo >= blockNo + depth
         in
             -- partition, not spanl!
             -- The limbo is unordered (multiple rollbacks at different heights).
             Seq.partition
               (not . pastConfirmed)
               -- First discard from limbo all confirmed tx IDs.
-              (Seq.filter (not . blockTxConfirmed) limbo)
+              (Seq.filter (not . txRefConfirmed) limbo)
   -- Remove orphaned txs from state first.
   STM.writeTVar (stateLimbo state) keepLimbo
   -- Broadcast orphaned txs.
-  forM_ toOrphan $ \entry -> do -- No `toList`, skips intermediate list.
-    STM.writeTChan (stateBroadcast state) (Left entry)
+  -- No `toList`, skips intermediate list.
+  forM_ toOrphan $ \(_blockNo, txRef) -> do
+    STM.writeTChan (stateBroadcast state) (Left txRef)
 

@@ -198,11 +198,14 @@ data RecyclerHandle key input payload = RecyclerHandle
   { -- | Fired by the recycler with the added entry (key, consumed inputs,
     -- produced outputs) and the resulting backlog size each time it adds a
     -- payload to the backlog.
-    rhOnAddToBacklog :: !(Recycler.OnAddToBacklogEvent key input)
-    -- | Fired by the recycler with the released payload's key, the inputs it
-    -- adds to the pipe and the resulting backlog size, each recycle. The key
-    -- pairs with 'rhOnAddToBacklog', so the wait is the time between the two.
-  , rhOnAddToPipe    :: !(Recycler.OnAddToPipeEvent key input)
+    rhOnHold         :: !(Recycler.OnHoldEvent key input)
+    -- | Fired by the recycler with the released payload's key, the set it
+    -- added to the pipe and the resulting backlog size, each recycle. 'Right'
+    -- is the produced outputs, 'Left' the consumed inputs, as on 'ohSubscribe'
+    -- below. The key pairs with 'rhOnHold', so the wait is the time between
+    -- the two, and the side says what settled the payload: 'Left' only ever
+    -- comes from an @on_confirm@ orphan.
+  , rhOnRelease      :: !(Recycler.OnReleaseEvent key input)
     -- | Fired with the dropped inputs, the dropped payloads, the fresh inputs
     -- and the resulting backlog size each time a reset drops the queued inputs
     -- and payloads and reseeds the input queue.
@@ -242,7 +245,7 @@ data Builder = Builder
     builderName     :: !String
     -- | Name of the 'pipes' entry it drives (takes from / adds to).
   , builderPipe     :: !String
-    -- | Name of the 'recyclers' entry it signals via 'Recycler.addToBacklog'.
+    -- | Name of the 'recyclers' entry it signals via 'Recycler.hold'.
   , builderRecycler :: !String
     -- | Linked async running the build loop.
   , builderAsync    :: !(Async.Async ())
@@ -444,7 +447,7 @@ resolve
 -- | Resolve one builder per workload into a name-keyed pool: spawn its build
 -- loop over the workload's pipe and recycler (both by workload name). Each loop
 -- takes inputs, builds a payload, records the tx's recyclable inputs with the
--- recycler ('Recycler.addToBacklog'), then enqueues the payload. Each 'Builder'
+-- recycler ('Recycler.hold'), then enqueues the payload. Each 'Builder'
 -- keeps its loop thread as 'builderAsync' (which 'resolve' also collects into
 -- 'asyncs'). The pipe fires its own (pure) trace handlers. The recycler owns
 -- all recycle timing.
@@ -466,7 +469,7 @@ resolveBuilders mkBuilderFn resolvedPipes resolvedRecyclers workloadsMap =
       -- builder's pipe and recycler, never the raw resources. 'baAddPayload'
       -- holds the recyclable inputs with the recycler, then makes the payload
       -- dequeuable, in that order: a release must never precede its
-      -- 'AddToBacklog' (see the Recycler invariants). Strategy wiring: no
+      -- 'Hold' (see the Recycler invariants). Strategy wiring: no
       -- strategy holds nothing, on_build confirms right at the build
       -- ('Recycler.releaseOutputs', reason-free), the deferred strategies
       -- confirm later (at dequeue or on an observer confirm). 'baDropInputs'
@@ -475,10 +478,10 @@ resolveBuilders mkBuilderFn resolvedPipes resolvedRecyclers workloadsMap =
       let recordBuild key consumed outputInputs = case strategy of
             Nothing -> pure ()
             Just Raw.RecycleOnBuild -> do
-              Recycler.addToBacklog recycler key consumed outputInputs
+              Recycler.hold recycler key consumed outputInputs
               Recycler.releaseOutputs recycler key
             Just _ ->
-              Recycler.addToBacklog recycler key consumed outputInputs
+              Recycler.hold recycler key consumed outputInputs
           api = BuilderApi
             { baTakeInputs = Pipe.takeInputs thePipe
             , baAddPayload = \key payload consumed outputInputs -> do
@@ -637,8 +640,8 @@ resolveRecyclers mkRecyclerHandleFn inputQueueNameByWorkload resolvedPipes workl
       recyclerHandle <- mkRecyclerHandleFn ix wlName inputQueueName
       internal <- Recycler.mkRecycler
                     (resolvedPipes Map.! wlName)
-                    (rhOnAddToBacklog recyclerHandle)
-                    (rhOnAddToPipe recyclerHandle)
+                    (rhOnHold recyclerHandle)
+                    (rhOnRelease recyclerHandle)
                     (rhOnReset recyclerHandle)
       worker <- Recycler.runRecycler internal wlName
       Async.link worker
