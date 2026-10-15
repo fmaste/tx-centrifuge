@@ -23,11 +23,13 @@ module Main (main) where
 -- base --
 ----------
 import Control.Concurrent (threadDelay)
-import Control.Exception (finally)
-import Control.Monad (foldM, forever, when)
+import Control.Exception (catch, finally)
+import Control.Monad (foldM, forM_, forever, when)
 import Data.Bifunctor (first)
+import Data.List (sortOn)
 import Data.Maybe (fromMaybe)
 import Data.Monoid (Last(..))
+import GHC.Conc.Sync (threadLabel)
 import Numeric.Natural (Natural)
 import System.Environment (getArgs)
 import System.Exit (die, exitSuccess)
@@ -137,9 +139,31 @@ import Cardano.Benchmarking.TxCentrifuge.TxAssembly qualified as TxAssembly
 import Cardano.Benchmarking.TxCentrifuge.Tracing.Dispatcher
   qualified as TracingDispatcher
 
+--------------------------------------------------------------------------------
 
+-- | Runs the program and names the thread when a linked one kills everything.
+--
+-- A linked thread's death propagates as an @ExceptionInLinkedThread@ exception
+-- carrying, alongside the original exception, only the thread's id and nothing
+-- else because the labels we set to every 'Async' with 'GHC.Conc.labelThread'
+-- go to the eventlog and never to 'show'. Simpler: the default message is a
+-- bare @Thread 910@ with nothing useful to map to our labeled 'Async's.
+-- Here the label is read back and put in the message. The table 'main'' prints
+-- to stderr covers what this cannot: it is written at startup, so it is there
+-- for a death that never reaches this handler, and it lists every 'Async' we
+-- link, so an id absent from it belongs to none of them.
 main :: IO ()
-main = do
+main =
+  main' `catch` \(Async.ExceptionInLinkedThread async_ inner) -> do
+    let tid = Async.asyncThreadId async_
+    label <- threadLabel tid
+    die $ show tid ++ " (" ++ fromMaybe "<unlabelled>" label ++ ") died: "
+       ++ show inner
+
+--------------------------------------------------------------------------------
+
+main' :: IO ()
+main' = do
 
   -- Loand and validate config.
   -----------------------------
@@ -577,6 +601,22 @@ main = do
     -- of waiting for A to finish first.
     let allAsyncs = Runtime.asyncs runtime ++ workers
         cancelAll = mapM_ Async.cancel allAsyncs
+    -- One line per linked thread, id and label, read back from the thread
+    -- itself: a thread's death is reported with its id alone (see 'main'), so
+    -- this is what maps it to what it was, a workload's builder, recycler,
+    -- target or observer bridge, or an observer itself. Printed once, nothing
+    -- being spawned later, and ordered by thread id, which is what a reader
+    -- arrives with.
+    threads <- mapM
+      (\async_ -> do
+        let tid = Async.asyncThreadId async_
+        label <- threadLabel tid
+        pure (tid, fromMaybe "<unlabelled>" label)
+      )
+      allAsyncs
+    forM_
+      (sortOn fst threads)
+      (\(tid, label) -> hPutStrLn stderr $ show tid ++ " = " ++ label)
     (_, result) <- flip finally cancelAll $
       Async.waitAnyCatch allAsyncs
     case result of

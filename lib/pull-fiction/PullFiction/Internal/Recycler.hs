@@ -237,7 +237,7 @@ runRecycler
   -> IO (Async.Async ())
 runRecycler recycler name = Async.async $ do
   tid <- myThreadId
-  labelThread tid (name ++ "/recycler")
+  labelThread tid ("workload/" ++ name ++ "/recycler")
   let -- Backlog size (the number of held payloads) as a 'Natural'.
       depthOf s = fromIntegral (Map.size s)
       -- Recycle one set of a held payload and forget the key: add the set to

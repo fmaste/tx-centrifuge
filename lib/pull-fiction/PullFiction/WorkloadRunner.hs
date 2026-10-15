@@ -72,7 +72,7 @@ type TargetWorker key input payload
 -- For each target the function:
 --
 -- 1. Reads the pre-built 'Pipe.PayloadFetcher' from 'Runtime.targetFetcher'.
--- 2. Computes a thread label: @workloadName ++ \"\/\" ++ targetName@.
+-- 2. Computes a thread label: @workload\/NAME\/target\/NAME@.
 -- 3. Creates an 'Async.Async' that labels the thread, then runs the worker
 --    callback with the two fetch actions.
 --
@@ -90,7 +90,8 @@ runWorkload workload targetWorker =
       let fetcher = Runtime.targetFetcher target
           -- Always labeled threads.
           threadLabel =
-            Runtime.workloadName workload ++ "/" ++ Runtime.targetName target
+               "workload/" ++ Runtime.workloadName workload
+            ++ "/target/"  ++ Runtime.targetName target
       -- Return async (unlinked, caller decides monitoring strategy).
       async <- Async.async $ do
         tid <- myThreadId

@@ -492,7 +492,7 @@ resolveBuilders mkBuilderFn resolvedPipes resolvedRecyclers workloadsMap =
       async <- Async.async $ do
         -- Always labeled threads.
         tid <- myThreadId
-        labelThread tid wlName
+        labelThread tid ("workload/" ++ wlName ++ "/builder")
         bhRunBuilder builderHandle api
       Async.link async
       pure ( wlName
@@ -816,7 +816,11 @@ resolveForwarders resolvedRecyclers resolvedObservers workloadsMap =
               forwarder <- Async.async $ do
                 -- Always labeled threads.
                 tid <- myThreadId
-                labelThread tid forwarderKey
+                -- The pool key already reads "workload/WORKLOAD/observer", all
+                -- three config words, here a workload may name one observer
+                -- from both "recycle" and "recovery", it is all that tells the
+                -- two threads apart.
+                labelThread tid ("workload/" ++ forwarderKey)
                 forever (STM.atomically readEvent >>= step)
               Async.link forwarder
               pure ( forwarderKey
