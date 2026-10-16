@@ -204,17 +204,36 @@ parseTxIn text =
 -- What the fold holds is the caller\'s business and the only thing that grows:
 -- this keeps one line and one fund at a time. The accumulator is forced at
 -- every step, so a lazy one cannot pile up thunks behind the fold.
+--
+-- The 'Int' pair is the stride and the number of passes, which select /which/
+-- funds are read and in /what order/, the sense the word has in cache and
+-- memory-access work: a stride is the distance between two consecutive
+-- accesses.
+--
+-- Pass @p@ (zero-based) reads the entries whose zero-based position is
+-- congruent to @p@ modulo the stride, and the passes run in order. So a stride
+-- of @s@ with one pass takes every @s@-th fund, evenly covering the file for a
+-- fraction of the decoding, and @s@ passes take every fund, in @s@ sweeps that
+-- each span the whole file. @1 1@ is the whole file in file order.
+--
+-- Both must be at least 1 and @passes@ at most @stride@, or a fund is read
+-- twice and its UTxO spent twice. The caller validates that, which is where
+-- the config error belongs.
 foldFunds
   :: Api.NetworkId
   -> FilePath
+  -- | Stride: the gap between the positions one pass reads.
+  -> Int
+  -- | Passes: how many of each stride's positions are read, at most 'stride'.
+  -> Int
   -> (acc -> Fund -> IO acc)
   -> acc
   -> IO (Either String acc)
-foldFunds networkId path step acc0 = do
+foldFunds networkId path stride passes step acc0 = do
   firstChar <- IO.withFile path IO.ReadMode firstNonSpace
   case firstChar of
-    Just '[' -> foldFundsArray networkId path step acc0
-    _        -> foldFundsLines networkId path step acc0
+    Just '[' -> foldFundsArray networkId path stride passes step acc0
+    _        -> foldFundsLines networkId path stride passes step acc0
   where
     -- Consumes whitespace only, from a handle that is closed right after.
     firstNonSpace h = do
@@ -227,19 +246,36 @@ foldFunds networkId path step acc0 = do
             then IO.hGetChar h >> firstNonSpace h
             else pure (Just c)
 
--- | Fold over a whole JSON array of fund objects.
+-- | Fold over a whole JSON array of fund objects, one pass per pass, each
+-- taking the positions its stride selects (see 'foldFunds').
+--
+-- The array is decoded whole either way, so a stride saves the fund building
+-- here and nothing else. This shape is for small files.
 foldFundsArray
   :: Api.NetworkId
   -> FilePath
+  -> Int
+  -> Int
   -> (acc -> Fund -> IO acc)
   -> acc
   -> IO (Either String acc)
-foldFundsArray networkId path step acc0 = do
+foldFundsArray networkId path stride passes step acc0 = do
   result <- Aeson.eitherDecodeFileStrict' path
   case result of
     Left err -> pure $ Left err
-    Right (entries :: [FundEntry]) -> go acc0 entries
+    Right (entries :: [FundEntry]) -> goPass 0 acc0 entries
   where
+    goPass pass !acc entries
+      | pass >= passes = pure $ Right acc
+      | otherwise = do
+          eAcc <- go acc
+            [ entry
+            | (ix, entry) <- zip [0 :: Int ..] entries
+            , ix `mod` stride == pass
+            ]
+          case eAcc of
+            Left err    -> pure $ Left err
+            Right acc'  -> goPass (pass + 1) acc' entries
     go !acc [] = pure $ Right acc
     go !acc (entry : rest) = do
       eFund <- entryToFund networkId entry
@@ -247,12 +283,18 @@ foldFundsArray networkId path step acc0 = do
         Left err   -> pure $ Left err
         Right fund -> step acc fund >>= \acc' -> go acc' rest
 
--- | Fold over a JSONL file of fund objects, one line at a time.
+-- | Fold over a JSONL file of fund objects, one line at a time, one sweep per
+-- pass (see 'foldFunds' for what the stride and the passes select).
 --
 -- Line N is fund N: every line has to be one fund object, a blank one
 -- included, so nothing shifts the correspondence between a line number and the
 -- fund it describes. An error names its line and stops the read, the handle
 -- closing with 'IO.withFile'.
+--
+-- A line the stride does not select is read and dropped, never decoded: the
+-- scan past it costs a line read, where a fund costs a JSON decode, a signing
+-- key and an address. That is what makes a stride cheaper than the file it
+-- covers.
 --
 -- Nothing is held but the accumulator: one line is read, parsed, turned into a
 -- 'Fund' and handed to @step@ before the next line is read, so no thunk is
@@ -260,27 +302,44 @@ foldFundsArray networkId path step acc0 = do
 foldFundsLines
   :: Api.NetworkId
   -> FilePath
+  -> Int
+  -> Int
   -> (acc -> Fund -> IO acc)
   -> acc
   -> IO (Either String acc)
-foldFundsLines networkId path step acc0 =
-  IO.withFile path IO.ReadMode $ \handle -> go handle (1 :: Int) acc0
+foldFundsLines networkId path stride passes step acc0 =
+  IO.withFile path IO.ReadMode $ \handle -> goPass handle 0 acc0
   where
-    go handle !lineNo !acc = do
+    -- One sweep per pass, each rewinding to the start. Sweep p takes the lines
+    -- whose zero-based position is congruent to p modulo the stride, so the
+    -- sweeps together read every selected line exactly once.
+    goPass handle pass !acc
+      | pass >= passes = pure $ Right acc
+      | otherwise = do
+          IO.hSeek handle IO.AbsoluteSeek 0
+          eAcc <- go handle pass (0 :: Int) acc
+          case eAcc of
+            Left err   -> pure $ Left err
+            Right acc' -> goPass handle (pass + 1) acc'
+    go handle pass !ix !acc = do
       eof <- IO.hIsEOF handle
       if eof
         then pure $ Right acc
         else do
           line <- BS8.hGetLine handle
-          case Aeson.eitherDecodeStrict' line of
-            Left err -> pure $ Left $ atLine lineNo err
-            Right entry -> do
-              eFund <- entryToFund networkId entry
-              case eFund of
-                Left err -> pure $ Left $ atLine lineNo err
-                Right fund ->
-                  step acc fund >>= \acc' -> go handle (lineNo + 1) acc'
-    atLine n err = path ++ ":" ++ show n ++ ": " ++ err
+          if ix `mod` stride /= pass
+            -- Not this sweep's line: dropped undecoded.
+            then go handle pass (ix + 1) acc
+            else case Aeson.eitherDecodeStrict' line of
+              Left err -> pure $ Left $ atLine ix err
+              Right entry -> do
+                eFund <- entryToFund networkId entry
+                case eFund of
+                  Left err -> pure $ Left $ atLine ix err
+                  Right fund ->
+                    step acc fund >>= \acc' -> go handle pass (ix + 1) acc'
+    -- Positions are zero-based, line numbers are not.
+    atLine ix err = path ++ ":" ++ show (ix + 1) ++ ": " ++ err
 
 -- | Convert one entry into a fund: take the key it carries inline, or read the
 -- file it names, then build the fund around it.

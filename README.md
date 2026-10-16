@@ -184,6 +184,26 @@ The `type` field selects the source. Two variants are available:
 
 **`genesis_utxo_keys`** — load funds from a fund file. `params`:
 - **`signing_keys_file`**: Path to the fund file (e.g. `funds.jsonl`) containing the actual fund data. Two shapes are accepted, a JSON array or JSONL, see below.
+- **`stride`** (optional, default `1`): the gap between the positions one pass reads, in the sense the word has in cache and memory-access work, where a stride is the distance between consecutive accesses. `1` reads the file in file order.
+- **`passes`** (optional, default `1`): how many of each stride's positions are read. Must not exceed `stride`, or a fund would be read twice and its UTxO spent twice, which is a startup error.
+
+Pass `p` (counting from zero) reads the funds whose position is `p` modulo the stride, and the passes run in order. So the pair selects **which** funds enter the queues and **in what order**:
+
+| `stride` / `passes` | funds loaded | order |
+|---------------------|--------------|-------|
+| `1` / `1` (default) | all | file order |
+| `s` / `1` | every `s`-th, so `1/s` of the file | one sweep, evenly spread over the whole file |
+| `s` / `s` | all | `s` sweeps, each spanning the whole file |
+| `s` / `p` (`p < s`) | `p/s` of the file | `p` sweeps, each spanning the whole file |
+
+Two uses:
+
+- **Use a fraction of a big file, without using only its start.** A queue is FIFO, so a run that spends fewer funds than it loaded spends a *prefix* of what was loaded. `stride: 13, passes: 1` instead loads an even thirteenth of the file, and skips the rest without decoding: a skipped line costs a line read, where a loaded one costs a JSON decode, a signing key and an address. On a file of 6.8M funds that is roughly 18 seconds instead of 239.
+- **Spend the whole file, but never two neighbours in a row.** `stride: 64, passes: 64` loads every fund in 64 sweeps. With `scope: "per_workload"` and `Q` input queues, the funds are handed out round-robin by load position, so one queue's consecutive funds end up `stride × Q` lines apart: with 51 workloads and `stride: 64`, 3264 lines apart, against 51 apart by default. The cost over the default is one extra scan of the file per pass, under a second per gigabyte each.
+
+A `--dry-run` reports how many funds the fold produced, which is the quickest check that a stride and pass count select what you meant.
+
+Note what this does not change: a fund file of genesis UTxOs has a TxId derived from each entry's own key, so the node's UTxO set sees those funds scattered whatever order they are loaded in. The stride controls which funds are used, in what order, and how far apart in the file consecutive spends sit.
 
 #### Fund file entry types
 

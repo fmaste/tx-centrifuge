@@ -38,7 +38,7 @@ import Text.Printf (printf)
 -----------
 -- aeson --
 -----------
-import Data.Aeson ((.:), (.:?))
+import Data.Aeson ((.!=), (.:), (.:?))
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Types qualified as Aeson.Types
 -----------
@@ -336,7 +336,7 @@ main' = do
                   Left err -> die $
                     "input_sources." ++ sourceName ++ ": " ++ err
                   Right (UTxOQuerySource path) -> pure path
-                  Right (GenesisKeysSource _)  -> die $
+                  Right (GenesisKeysSource _ _ _) -> die $
                     "Builder " ++ builderName ++ ": recovery source "
                     ++ show sourceName ++ " is a static file and cannot"
                     ++ " rebuild inputs after a reset, use a \"utxo_query\""
@@ -639,8 +639,11 @@ main' = do
 data FundSource
   -- | Query the UTxOs at addresses through a NodeToClient socket.
   = UTxOQuerySource !FilePath
-  -- | Load funds from a genesis signing-keys file.
-  | GenesisKeysSource !FilePath
+  -- | Load funds from a genesis signing-keys file, reading it with this
+  -- stride and this many passes (see 'Fund.foldFunds'): the stride is the gap
+  -- between the positions one pass reads, as the word is used of memory
+  -- access, and the passes are how many of each stride's positions are read.
+  | GenesisKeysSource !FilePath !Int !Int
 
 -- | Interpret a 'Raw.InputSource' (opaque type + params) into a concrete
 -- 'FundSource'.
@@ -660,8 +663,21 @@ interpretInputSource raw = case Raw.inputSourceType raw of
   where
     parseQuery = Aeson.withObject "UTxOQuery InputSourceParams" $ \o ->
       UTxOQuerySource <$> o .: "socket_path"
-    parseGenesis = Aeson.withObject "GenesisKeys InputSourceParams" $ \o ->
-      GenesisKeysSource <$> o .: "signing_keys_file"
+    parseGenesis = Aeson.withObject "GenesisKeys InputSourceParams" $ \o -> do
+      path   <- o .:  "signing_keys_file"
+      stride <- o .:? "stride" .!= 1
+      passes <- o .:? "passes" .!= 1
+      when (stride < 1) $
+        fail $ "\"stride\" must be at least 1, got " ++ show stride
+      when (passes < 1) $
+        fail $ "\"passes\" must be at least 1, got " ++ show passes
+      -- Pass p reads the positions congruent to p modulo the stride, so more
+      -- passes than the stride would read a position twice and spend its UTxO
+      -- twice.
+      when (passes > stride) $
+        fail $ "\"passes\" (" ++ show passes ++ ") must not exceed \"stride\" ("
+            ++ show stride ++ "): every pass beyond the stride repeats funds"
+      pure (GenesisKeysSource path stride passes)
 
 -- | Interpret the opaque use-site @params@ of @initial_inputs@ for a
 -- @utxo_query@ source: the signing key files. Each key's derived address is
@@ -933,12 +949,14 @@ loadConfig = do
     case source of
       -- The source is self-contained, reject use-site params instead of
       -- silently ignoring them.
-      GenesisKeysSource path -> case maybeParams of
+      GenesisKeysSource path stride passes -> case maybeParams of
         Just _  -> die $
           "initial_inputs: a \"genesis_utxo_keys\" source takes no \"params\""
         Nothing -> pure (InitialFunds (\step seed -> do
           hPutStrLn stderr $ "Loading funds from: " ++ path
-          Fund.foldFunds networkId path step seed
+            ++ " (stride " ++ show stride
+            ++ ", " ++ show passes ++ " pass(es))"
+          Fund.foldFunds networkId path stride passes step seed
             >>= either (\err -> die $ "initial_inputs: " ++ err) pure))
       -- The source only knows how to query, the use site says what to query
       -- for, so the keys are read here and travel with it.
